@@ -4,7 +4,7 @@ A reproduction of the two core contributions of **DreamWaQ** (Nahrendra, Yu & My
 
 **Result:** the proprioception-only policy matched a privileged baseline on terrain difficulty and episode length, trailing it by ~3 reward and ~0.1 m/s tracking error. CENet recovered true body velocity to **MSE ≈ 0.006 (m/s)²** from proprioceptive history alone.
 
-![Trained policy on rough terrain](docs/figures/rough_terrain_rollout.png)
+https://github.com/user-attachments/assets/daabeb17-dc1e-4bb3-8c0d-82a0601c9b6a
 
 *Trained Go2 robots crossing discrete-obstacle terrain in Isaac Sim, each tracking its own velocity command.*
 
