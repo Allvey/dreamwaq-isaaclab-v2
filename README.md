@@ -1,4 +1,4 @@
-# DreamWaQ in Isaac Lab — Unitree Go2
+# DreamWaQ in Isaac Lab - Unitree Go2
 
 A reproduction of the two core contributions of **DreamWaQ** (Nahrendra, Yu & Myung, ICRA 2023) in NVIDIA Isaac Lab on a Unitree Go2: an **asymmetric actor-critic** and **CENet**, a context-aided estimator that lets the deployed policy run on proprioception alone.
 
@@ -12,9 +12,9 @@ A reproduction of the two core contributions of **DreamWaQ** (Nahrendra, Yu & My
 
 ## The problem
 
-In simulation an RL policy can see privileged information — the exact terrain under the robot, its true base velocity. A real quadruped has neither. It has joint encoders and an IMU. So a policy trained on privileged inputs cannot be deployed.
+In simulation an RL policy can see privileged information - the exact terrain under the robot, its true base velocity. A real quadruped has neither. It has joint encoders and an IMU. So a policy trained on privileged inputs cannot be deployed.
 
-DreamWaQ's answer is to have the robot infer that hidden state from its own recent proprioceptive history, and to train the policy, the value function, and the estimator **together in a single phase** — no teacher-student distillation.
+DreamWaQ's answer is to have the robot infer that hidden state from its own recent proprioceptive history, and to train the policy, the value function, and the estimator **together in a single phase** - no teacher-student distillation.
 
 ## Method
 
@@ -34,7 +34,7 @@ Actor input **64** (45 + 3 velocity + 16 latent) · Critic input **235** (45 + 1
 L = MSE(v̂, v) + MSE(ô, o) + β · KL( z ‖ N(0, I) )
 ```
 
-CENet's outputs are **detached** before reaching the actor, so the policy's gradient cannot reshape the estimator — it learns only from its own prediction error.
+CENet's outputs are **detached** before reaching the actor, so the policy's gradient cannot reshape the estimator - it learns only from its own prediction error.
 
 ![CENet architecture](docs/figures/cenet_architecture.png)
 
@@ -48,7 +48,7 @@ Both policies: 2000 iterations, seed 1, identical curriculum and rewards. The on
 | Mean episode length | 940 | 915 |
 | Linear-velocity error (m/s) | 0.41 | 0.50 |
 | Terrain curriculum level | 5.46 | 5.35 |
-| CENet velocity MSE | — | 0.012 (train) / 0.0058 (eval) |
+| CENet velocity MSE | - | 0.012 (train) / 0.0058 (eval) |
 | **Actor observation dim** | **235 (privileged)** | **64 (deployable)** |
 
 The last row is the point. Near-equal locomotion from a quarter of the observations, none of them privileged.
@@ -57,7 +57,7 @@ The last row is the point. Near-equal locomotion from a quarter of the observati
 
 ![CENet velocity estimate vs ground truth](docs/figures/cenet_velocity_estimate.png)
 
-The estimate (orange) tracks true body velocity (black) on all three axes, including the rapid vertical swings as the body bounces during walking — from proprioceptive history alone. This is what makes the proprioception-only policy work.
+The estimate (orange) tracks true body velocity (black) on all three axes, including the rapid vertical swings as the body bounces during walking - from proprioceptive history alone. This is what makes the proprioception-only policy work.
 
 ### Training curves
 
@@ -69,7 +69,7 @@ The estimate (orange) tracks true body velocity (black) on all three axes, inclu
 |---|---|
 | ![](docs/figures/velocity_tracking_error.png) | ![](docs/figures/terrain_curriculum.png) |
 
-The curves track closely for ~400 iterations, after which the baseline holds a steady lead of roughly three reward points — the expected cost of replacing privileged inputs with inferred state. Both finish at essentially the same terrain level (5.46 vs 5.35).
+The curves track closely for ~400 iterations, after which the baseline holds a steady lead of roughly three reward points - the expected cost of replacing privileged inputs with inferred state. Both finish at essentially the same terrain level (5.46 vs 5.35).
 
 ![CENet hybrid-loss components](docs/figures/cenet_losses.png)
 
@@ -112,7 +112,7 @@ isaaclab.sh -p scripts/rollout_eval.py \
 Each component was gated on a pass/fail check before the next was built:
 
 1. Stock task trains
-2. Forked task trains identically — package works
+2. Forked task trains identically - package works
 3. Printed dims confirm asymmetry (actor 64, critic 235)
 4. Unit tests: output shapes, finite differentiable loss, gradients reach the shared encoder from CENet's loss but **not** the actor's
 5. Live run shows CENet losses decreasing
@@ -139,30 +139,30 @@ docs/                          full report (PDF) and figures
 
 ## Full report
 
-The complete write-up — method, implementation decisions, verification strategy, and discussion — is in [`docs/DreamWaQ_Report_Roman_Kalyna.pdf`](docs/DreamWaQ_Report_Roman_Kalyna.pdf).
+The complete write-up - method, implementation decisions, verification strategy, and discussion - is in [`docs/DreamWaQ_Report_Roman_Kalyna.pdf`](docs/DreamWaQ_Report_Roman_Kalyna.pdf).
 
 ## Limitations
 
 Stated plainly, since this is a reproduction rather than a replication of the paper's numbers:
 
-- Single seed — indicative, not statistically supported. No error bars.
+- Single seed - indicative, not statistically supported. No error bars.
 - 2048 parallel envs vs the paper's 4096 (8 GB VRAM limit).
 - Go2 in Isaac Lab rather than A1 in Isaac Gym.
 - The AdaBoot adaptive-bootstrapping gate was not implemented.
 - The VAE reconstructs the *current* observation rather than the next, to avoid modifying rollout storage.
-- β fixed at 0.5 by hand — chosen because β = 1 caused posterior collapse. Not swept.
+- β fixed at 0.5 by hand - chosen because β = 1 caused posterior collapse. Not swept.
 - The critic receives the height scan and true velocity but not the paper's random disturbance force, so it is slightly less privileged than the original.
 
 ## References
 
 - I. M. A. Nahrendra, B. Yu, H. Myung, "DreamWaQ: Learning Robust Quadrupedal Locomotion With Implicit Terrain Imagination via Deep Reinforcement Learning," ICRA 2023. [arXiv:2301.10602](https://arxiv.org/abs/2301.10602)
-- N. Rudin et al., "Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning," CoRL 2022 — the `rsl_rl` PPO implementation.
-- M. Mittal et al., "Orbit: A Unified Simulation Framework for Interactive Robot Learning Environments," RA-L 2023 — predecessor of Isaac Lab.
-- [Manaro-Alpha/DreamWaQ](https://github.com/Manaro-Alpha/DreamWaQ) — public reference implementation targeting Isaac Gym, consulted for network and training design.
+- N. Rudin et al., "Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning," CoRL 2022 - the `rsl_rl` PPO implementation.
+- M. Mittal et al., "Orbit: A Unified Simulation Framework for Interactive Robot Learning Environments," RA-L 2023 - predecessor of Isaac Lab.
+- [Manaro-Alpha/DreamWaQ](https://github.com/Manaro-Alpha/DreamWaQ) - public reference implementation targeting Isaac Gym, consulted for network and training design.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Depends on NVIDIA Isaac Lab (BSD-3-Clause) and `rsl_rl` (BSD-3-Clause), neither of which is vendored here.
+MIT - see [LICENSE](LICENSE). Depends on NVIDIA Isaac Lab (BSD-3-Clause) and `rsl_rl` (BSD-3-Clause), neither of which is vendored here.
 
 ---
 
