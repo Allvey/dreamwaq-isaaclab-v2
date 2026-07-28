@@ -1,0 +1,11 @@
+# Core dependencies are provided by the Isaac Lab installation.
+# Listed here for reference:
+#
+#   NVIDIA Isaac Lab 2.0  (Isaac Sim 4.5)
+#   rsl_rl == 3.1.2
+#   torch                 (installed with Isaac Sim)
+#
+# Additional packages used by the plotting / evaluation scripts:
+matplotlib
+numpy
+tensorboard
