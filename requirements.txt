@@ -9,3 +9,5 @@
 matplotlib
 numpy
 tensorboard
+# TensorBoard 2.20 still imports pkg_resources, removed in setuptools 82.
+setuptools==80.9.0

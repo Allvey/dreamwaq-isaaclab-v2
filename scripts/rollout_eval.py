@@ -18,13 +18,18 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import importlib.util
 import os
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
 # cli_args lives next to play.py; add that dir so we can import it from anywhere.
-_RSL_RL_SCRIPTS = os.path.expanduser("~/IsaacLab/scripts/reinforcement_learning/rsl_rl")
+_LAB_ROOT = Path(os.environ["ISAACLAB_PATH"]) if os.environ.get("ISAACLAB_PATH") else Path(
+    importlib.util.find_spec("isaaclab").origin
+).resolve().parents[3]
+_RSL_RL_SCRIPTS = str(_LAB_ROOT / "scripts/reinforcement_learning/rsl_rl")
 if os.path.isdir(_RSL_RL_SCRIPTS) and _RSL_RL_SCRIPTS not in sys.path:
     sys.path.insert(0, _RSL_RL_SCRIPTS)
 import cli_args  # noqa: E402  (from the rsl_rl scripts dir)
@@ -66,7 +71,7 @@ from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg  # noqa: E402
 from isaaclab.utils.assets import retrieve_file_path  # noqa: E402
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper  # noqa: E402
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper  # noqa: E402
 
 import isaaclab_tasks  # noqa: F401, E402  (registers tasks + injects DreamWaQ classes)
 from isaaclab_tasks.utils import get_checkpoint_path  # noqa: E402
@@ -78,7 +83,7 @@ def _to_np(t):
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     # --- mirror play.py's env + checkpoint setup ---
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -94,7 +99,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Loading model checkpoint from: {resume_path}")
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env = RslRlVecEnvWrapper(env)
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(resume_path)

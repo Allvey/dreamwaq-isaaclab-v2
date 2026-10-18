@@ -2,8 +2,6 @@
 
 import gymnasium as gym
 
-from . import agents
-
 # ---------------------------------------------------------------------------
 # Make our custom rsl_rl classes resolvable by the runner.
 # ---------------------------------------------------------------------------
@@ -33,7 +31,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rough_env_cfg:Go2DreamWaQRoughEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go2DreamWaQRoughPPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.rsl_rl_ppo_cfg:Go2DreamWaQRoughPPORunnerCfg",
     },
 )
 
@@ -43,7 +41,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rough_env_cfg:Go2DreamWaQRoughEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go2DreamWaQRoughPPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.rsl_rl_ppo_cfg:Go2DreamWaQRoughPPORunnerCfg",
     },
 )
 

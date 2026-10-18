@@ -21,7 +21,8 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.agents.rsl_rl_p
 class Go2DreamWaQRoughPPORunnerCfg(UnitreeGo2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "go2_dreamwaq_rough"
+        # Shared comparison root: logs/rsl_rl/{isaaclab,newton}/<experiment>/.
+        self.experiment_name = "isaaclab/go2_dreamwaq_rough"
 
         # Asymmetric actor-critic (DreamWaQ contribution #1):
         #   actor  -> proprioception only (45) + CENet's v_hat(3) + z(16) = 64
