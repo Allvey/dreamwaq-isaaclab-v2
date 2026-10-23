@@ -176,6 +176,59 @@ updates, including base-contact termination. Height scans see the nominal top,
 not footprint depressions. Memory is per environment and is cleared on reset.
 Tune physical parameters with Hydra, e.g. `env.scene.terrain.depth=0.10` or
 `env.scene.terrain.material=f0.9`, without changing model code.
+
+### Mixed original rough terrain and flat soil
+
+`mixed-train` uses one policy and the original PPO update with fresh samples from
+both groups in every rollout. By default half the environments use the complete
+original rough terrain generator (including its original terrain proportions and
+difficulty curriculum); half use the current flat f0.75 soil at 0.15 m depth.
+Groups are fixed for a run. The soil patch is separate from the rough mesh;
+crossing a hard/soft boundary within an episode is not part of this first stage.
+Original rough triangles are retained, and the soil kernel's rigid-world branch
+adds no forces or footprint memory to rough environments. The nominal soil top
+has no collider; only the bottom at -depth collides. Height scans use the original
+rough geometry and the nominal soil top, excluding the bottom.
+
+The mixed scene shares the validated soil timestep of **0.3125 ms**, 64 substeps,
+50 Hz control and a 15 ms contact-history window. Historical original rough runs
+use 5 ms physics. They remain separate evaluation references; mixed-scene hard
+physics must not be described as identical to that historical timestep.
+Network/CENet inputs, losses, PPO settings, rewards, commands and actuators are
+unchanged. Terrain curriculum applies only to the rough group; soft origins and
+per-environment soil memory remain isolated across resets.
+
+```bash
+# Acceptance only: geometry, force/contact/reset isolation and one discarded
+# PPO update. No trained checkpoint is written and runner.learn is not called.
+bash scripts/isaac.sh mixed-check --headless --num_envs 8 --steps 100
+
+# Start formal training MANUALLY from the original rough checkpoint.
+bash scripts/isaac.sh mixed-train --headless --num_envs 2048 \
+  --max_iterations 2000 --seed 1 --run_name rough_soft_50_50_seed1 \
+  env.scene.terrain.soft_fraction=0.5 \
+  agent.init_checkpoint=/home/allvey/Projects/robotics/dreamwaq-isaaclab/logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1/model_1999.pt
+
+# View the mixed task, initially following rough env 0 (at least two required).
+bash scripts/isaac.sh mixed-play --num_envs 8 --checkpoint /absolute/path/model.pt
+
+# Evaluate the SAME checkpoint separately on the historical native rough task
+# and on the current flat soil, with the same fixed commands and seed.
+bash scripts/isaac.sh soft-rollout --single --original_rough --headless \
+  --num_envs 16 --seed 1 --phase_seconds 4 --cycles 2 \
+  --checkpoint /absolute/path/model.pt
+bash scripts/isaac.sh soft-rollout --single --headless \
+  --num_envs 16 --seed 1 --phase_seconds 4 --cycles 2 \
+  --checkpoint /absolute/path/model.pt
+```
+
+Mixed checkpoints, TensorBoard events and resolved configurations are stored in
+`logs/rsl_rl/isaaclab/go2_dreamwaq_mixed/<run>/`. The configuration records the
+rough mesh hash and actual rounded group sizes. TensorBoard's `Mixed/` series
+separate rough/soft reward per simulated second, termination/timeout fractions
+per step, and the actual soft sample fraction; these are not episode success
+rates. Use `logs/rsl_rl/` as the TensorBoard root. Evaluate multiple seeds before
+selecting a checkpoint; combined training reward alone can hide standing drift.
 A passing short check verifies interfaces and finite physics, not locomotion
 performance or calibration to real soil.
 

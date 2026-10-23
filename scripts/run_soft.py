@@ -1,4 +1,4 @@
-"""Run the original IsaacLab runner with an independent flat-soil environment."""
+"""Run the original IsaacLab runner with flat soil or mixed rough/soil environments."""
 
 import os
 from pathlib import Path
@@ -25,6 +25,13 @@ def register_tasks():
             entry_point="soft_terrain:make_env", disable_env_checker=True,
             kwargs={"env_cfg_entry_point": f"soft_terrain:{config}",
                     "rsl_rl_cfg_entry_point": "soft_terrain:Go2SoftRunnerCfg"},
+        )
+    for suffix, config in (("", "Go2MixedEnvCfg"), ("-Play", "Go2MixedPlayEnvCfg")):
+        gym.register(
+            id=f"Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed{suffix}-v0",
+            entry_point="soft_terrain:make_env", disable_env_checker=True,
+            kwargs={"env_cfg_entry_point": f"soft_terrain:{config}",
+                    "rsl_rl_cfg_entry_point": "soft_terrain:Go2MixedRunnerCfg"},
         )
 
 
@@ -162,6 +169,239 @@ def check(arguments):
             assert (sensor._data.net_forces_w_history[0] == 0).all()
         print(f"[SOFT CHECK PASS] envs={args.num_envs} steps={args.steps} "
               f"soft={soil is not None} contact_steps={contact_steps} max_body_force={max_force:.2f} N", flush=True)
+        diagnostic_status(True)
+    except Exception:
+        diagnostic_status(False)
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        if env is not None:
+            env.close()
+        app.close()
+
+
+def mixed_check(arguments):
+    """Mixed geometry/force/reset and disposable PPO-update acceptance; no saved policy."""
+    import argparse
+    from isaaclab.app import AppLauncher
+
+    parser = argparse.ArgumentParser(description=mixed_check.__doc__)
+    parser.add_argument("--num_envs", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--soft_fraction", type=float, default=0.5)
+    parser.add_argument("--checkpoint", help="Optional weights to verify exact warm start")
+    parser.add_argument("--no_adapter", action="store_true", help="Diagnostic rigid-group reference only")
+    parser.add_argument("--record", help="Optional rigid-group state archive for paired acceptance")
+    parser.add_argument("--compare", help="Require exact rigid-group equality to --no_adapter archive")
+    AppLauncher.add_app_launcher_args(parser)
+    args = parser.parse_args(arguments)
+    if args.num_envs < 4 or args.steps < 50:
+        parser.error("Use at least 4 environments and 50 steps")
+    app, env = AppLauncher(args).app, None
+    try:
+        import hashlib
+        import json
+        import numpy as np
+        import torch
+        import gymnasium as gym
+        from omegaconf import OmegaConf
+        from pxr import Usd, UsdGeom, UsdPhysics
+        import omni.usd
+        import soft_terrain as soft
+        from isaaclab.envs.mdp.actions import JointPositionAction
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+        from isaaclab.utils.warp import raycast_mesh
+
+        cfg = soft.Go2MixedEnvCfg()
+        cfg.scene.num_envs, cfg.seed, cfg.sim.device = args.num_envs, args.seed, args.device
+        cfg.scene.terrain.soft_fraction = args.soft_fraction
+        cfg.scene.terrain.terrain_generator.seed = args.seed
+        baseline = soft.Go2DreamWaQRoughEnvCfg()
+        for name in ("observations", "rewards", "terminations", "events", "commands"):
+            assert getattr(cfg, name).to_dict() == getattr(baseline, name).to_dict(), name
+        assert cfg.actions.to_dict() == baseline.actions.to_dict()
+        assert cfg.scene.robot.to_dict() == baseline.scene.robot.to_dict()
+        assert cfg.scene.terrain.terrain_generator.to_dict() == dict(
+            baseline.scene.terrain.terrain_generator.to_dict(), seed=args.seed,
+        )
+        assert abs(cfg.sim.dt * cfg.decimation - 0.02) < 1e-12
+        assert abs(cfg.scene.contact_forces.history_length * cfg.sim.dt - 0.015) < 1e-12
+        env = RslRlVecEnvWrapper(gym.make("Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed-v0", cfg=cfg))
+        raw = env.unwrapped
+        terrain, robot, sensor = raw.scene.terrain, raw.scene["robot"], raw.scene["contact_forces"]
+        soil = raw.action_manager.get_term("joint_pos").soil
+        rigid, sand = ~terrain.soft_mask, terrain.soft_mask
+        assert rigid.any() and sand.any()
+        assert terrain.num_soft == round(args.num_envs * args.soft_fraction)
+        original_origins = terrain.env_origins.clone()
+        mesh = terrain.meshes["terrain"]
+        assert hashlib.sha256(mesh.vertices.tobytes() + mesh.faces.tobytes()).hexdigest() == cfg.scene.terrain.rough_mesh_sha256
+        # Regenerate the stock mesh with the same seed, preserving global RNGs.
+        from isaaclab.terrains import TerrainGenerator
+        np_state, torch_state = np.random.get_state(), torch.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        np.random.set_state(terrain._rough_numpy_state)
+        torch.set_rng_state(terrain._rough_torch_state)
+        if cuda_state:
+            torch.cuda.set_rng_state_all(terrain._rough_cuda_state)
+        reference = TerrainGenerator(cfg=baseline.scene.terrain.terrain_generator.replace(seed=args.seed), device=env.device)
+        np.testing.assert_array_equal(reference.terrain_mesh.vertices, mesh.vertices)
+        np.testing.assert_array_equal(reference.terrain_mesh.faces, mesh.faces)
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+        if cuda_state:
+            torch.cuda.set_rng_state_all(cuda_state)
+        del reference
+        assert (terrain.terrain_types[rigid] == torch.div(
+            torch.arange(terrain.num_rough, device=env.device),
+            terrain.num_rough / terrain.terrain_origins.shape[1], rounding_mode="floor").long()).all()
+        stage = omni.usd.get_context().get_stage()
+        for path in ("/World/soil_surface", "/World/mixed_height_scan"):
+            for prim in Usd.PrimRange(stage.GetPrimAtPath(path)):
+                assert not prim.HasAPI(UsdPhysics.CollisionAPI), path
+        # The soft patch is outside the entire original rough mesh, including its border.
+        assert float(terrain.soft_bounds[1, 0]) < mesh.bounds[0, 0]
+        query = terrain.env_origins.clone()
+        query[:, 2] += 5
+        direction = torch.zeros_like(query)
+        direction[:, 2] = -1
+        nominal = raycast_mesh(query, direction, raw.scene["height_scanner"].meshes["/World/mixed_height_scan"])[0]
+        bottom = raycast_mesh(query[sand], direction[sand], terrain.warp_meshes["soil_bottom"])[0]
+        torch.testing.assert_close(nominal[sand, 2], torch.zeros_like(nominal[sand, 2]), atol=1e-5, rtol=0)
+        torch.testing.assert_close(bottom[:, 2], torch.full_like(bottom[:, 2], -cfg.scene.terrain.depth), atol=1e-5, rtol=0)
+        rough_hits = raycast_mesh(query[rigid], direction[rigid], terrain.warp_meshes["terrain"])[0]
+        torch.testing.assert_close(nominal[rigid], rough_hits, rtol=0, atol=1e-5)
+
+        # Identical buried fixtures in both groups must produce force/memory in SOFT only.
+        soil.q.zero_()
+        soil.q[..., 2], soil.q[..., 6] = 0.5, 1
+        soil.q[:, soil.feet, 2] = soil.proxy.R_FOOT - 0.02
+        soil.qd.zero_()
+        soil.evaluate()
+        assert soil.wrench[rigid].count_nonzero() == 0 and soil.normal_w[rigid].count_nonzero() == 0
+        assert (soil.mem[rigid] == -1).all() and soil.hole_n[rigid].count_nonzero() == 0
+        assert (soil.normal_w[sand][:, soil.feet, 2] > 1).all()
+        soil.reset()
+        if args.no_adapter:
+            # Same scene, native action implementation; soft robots can fall.
+            # Only the physically isolated rough group is compared below.
+            term = raw.action_manager.get_term("joint_pos")
+            term.apply_actions = lambda: JointPositionAction.apply_actions(term)
+
+        records = {name: [] for name in ("root", "joint", "contact", "reward")}
+        max_soft_depth, soft_contact_steps = 0.0, 0
+        zero = torch.zeros((env.num_envs, 12), device=env.device)
+        for step in range(args.steps):
+            with torch.inference_mode():
+                obs, reward, done, extras = env.step(zero)
+            for name, width in (("policy", 45), ("prop_history", 225), ("height_scan", 187), ("privileged_vel", 3)):
+                assert obs[name].shape == (env.num_envs, width) and torch.isfinite(obs[name]).all(), name
+            assert torch.isfinite(robot.data.root_state_w).all() and torch.isfinite(reward).all()
+            assert abs(float(extras["log"]["Mixed/soft_sample_fraction"]) - terrain.num_soft / args.num_envs) < 1e-6
+            if not args.no_adapter:
+                assert soil.wrench[rigid].count_nonzero() == 0 and soil.normal_w[rigid].count_nonzero() == 0
+                assert (soil.mem[rigid] == -1).all() and soil.hole_n[rigid].count_nonzero() == 0
+                assert torch.isfinite(soil.wrench).all()
+                max_soft_depth = max(max_soft_depth, float(soil.depth[sand].max()))
+                soft_contact_steps += int((soil.normal_w[sand][:, soil.feet, 2] > 1).any())
+                view = sensor.contact_physx_view
+                physical = view.physical.get_net_contact_forces(dt=cfg.sim.dt).view(env.num_envs, -1, 3)
+                merged = view.get_net_contact_forces(dt=cfg.sim.dt).view(env.num_envs, -1, 3)
+                torch.testing.assert_close(merged[rigid], physical[rigid], rtol=0, atol=0)
+                torch.testing.assert_close(merged[sand], (physical + soil.normal_w[:, sensor.robot_body_ids])[sand])
+            for name, value in zip(records, (robot.data.root_state_w, robot.data.joint_pos, sensor.data.net_forces_w, reward)):
+                records[name].append(value[rigid].cpu().numpy().copy())
+        if args.record:
+            np.savez_compressed(args.record, **{name: np.stack(value) for name, value in records.items()},
+                                origins=original_origins.cpu().numpy(), rough_mesh_sha256=cfg.scene.terrain.rough_mesh_sha256)
+        if args.compare:
+            with np.load(args.compare) as reference:
+                assert str(reference["rough_mesh_sha256"]) == cfg.scene.terrain.rough_mesh_sha256
+                np.testing.assert_array_equal(reference["origins"], original_origins.cpu().numpy())
+                for name, value in records.items():
+                    np.testing.assert_array_equal(np.stack(value), reference[name], err_msg=name)
+            print("[Mixed check] rough trajectories match native-action reference bit for bit", flush=True)
+        if not args.no_adapter:
+            assert soft_contact_steps > 0 and max_soft_depth > 0
+            # A curriculum update containing both groups must only move rough IDs.
+            levels, origins = terrain.terrain_levels.clone(), terrain.env_origins.clone()
+            ids = torch.arange(env.num_envs, device=env.device)
+            terrain.update_env_origins(ids, torch.ones_like(ids, dtype=torch.bool),
+                                       torch.zeros_like(ids, dtype=torch.bool))
+            torch.testing.assert_close(terrain.env_origins[sand], origins[sand], rtol=0, atol=0)
+            torch.testing.assert_close(terrain.terrain_levels[sand], levels[sand], rtol=0, atol=0)
+            unsaturated = rigid & (levels + 1 < terrain.max_terrain_level)
+            assert (terrain.terrain_levels[unsaturated] == levels[unsaturated] + 1).all()
+            terrain.terrain_levels.copy_(levels)
+            terrain.env_origins.copy_(origins)
+            # Exercise the real reset/curriculum path with one ID from each group.
+            soft_id, rigid_id = sand.nonzero()[0, 0], rigid.nonzero()[0, 0]
+            untouched_id = sand.nonzero()[-1, 0]
+            soil.hole_d[sand] = 0.03
+            memory = soil.hole_d[untouched_id].clone()
+            with torch.inference_mode():
+                raw._reset_idx(torch.stack((soft_id, rigid_id)))
+            torch.testing.assert_close(terrain.env_origins[sand], original_origins[sand], rtol=0, atol=0)
+            assert soil.hole_d[soft_id].count_nonzero() == 0 and (soil.mem[soft_id] == -1).all()
+            if soft_id != untouched_id:
+                torch.testing.assert_close(soil.hole_d[untouched_id], memory, rtol=0, atol=0)
+            soil.reset()
+
+            agent_cfg = soft.Go2MixedRunnerCfg()
+            resolved = OmegaConf.create(agent_cfg.to_dict())
+            if args.checkpoint:
+                resolved.init_checkpoint = args.checkpoint
+            agent_cfg.from_dict(OmegaConf.to_container(resolved, resolve=True))
+            agent, original = agent_cfg.to_dict(), soft.Go2DreamWaQRoughPPORunnerCfg().to_dict()
+            for name in ("experiment_name", "init_checkpoint"):
+                agent.pop(name, None)
+                original.pop(name, None)
+            assert agent == original, "Original network/PPO settings changed"
+            runner = soft.make_runner(env, agent_cfg.to_dict(), log_dir=None, device=env.device)
+            policy = runner.alg.policy
+            if args.checkpoint:
+                source = torch.load(args.checkpoint, map_location=env.device, weights_only=False)
+                for name, value in policy.state_dict().items():
+                    torch.testing.assert_close(value, source["model_state_dict"][name], rtol=0, atol=0)
+                assert runner.current_learning_iteration == 0 and not runner.alg.optimizer.state
+            # One disposable update through the original algorithm. Tag only the
+            # storage dictionary, never actor/critic observations, to audit both groups.
+            with torch.inference_mode():
+                obs = env.get_observations()
+                for _ in range(runner.num_steps_per_env):
+                    actions = runner.alg.act(obs)
+                    obs, rewards, dones, extras = env.step(actions)
+                    runner.alg.process_env_step(obs, rewards, dones, extras)
+                runner.alg.compute_returns(obs)
+            storage = runner.alg.storage
+            tags = terrain.soft_mask.float().view(1, -1, 1).expand(runner.num_steps_per_env, -1, -1).clone()
+            storage.observations["_diagnostic_domain"] = tags
+            batches, samples = 0, [0, 0]
+            native_generator = storage.mini_batch_generator
+            def audited_batches(*args, **kwargs):
+                nonlocal batches
+                for batch in native_generator(*args, **kwargs):
+                    marker = batch[0].pop("_diagnostic_domain").flatten()
+                    samples[0] += int((marker == 0).sum())
+                    samples[1] += int((marker == 1).sum())
+                    batches += 1
+                    yield batch
+            storage.mini_batch_generator = audited_batches
+            before = {name: value.clone() for name, value in policy.state_dict().items()}
+            losses = runner.alg.update()
+            storage.mini_batch_generator = native_generator
+            assert min(samples) > 0 and all(np.isfinite(value) for value in losses.values())
+            assert all(torch.isfinite(value).all() for value in policy.state_dict().values())
+            assert any(not torch.equal(before[name], value) for name, value in policy.state_dict().items())
+            expected = runner.num_steps_per_env * runner.alg.num_learning_epochs
+            assert samples == [terrain.num_rough * expected, terrain.num_soft * expected], samples
+            print(f"[Mixed check] discarded one PPO update: batches={batches}, rough/soft samples={samples}, losses={losses}", flush=True)
+            # Discard the update; no checkpoint or training run is written.
+            policy.load_state_dict(before)
+        print(f"[MIXED CHECK PASS] rough={terrain.num_rough} soft={terrain.num_soft} "
+              f"steps={args.steps} soft_contact_steps={soft_contact_steps} max_soft_depth={max_soft_depth:.4f} m", flush=True)
         diagnostic_status(True)
     except Exception:
         diagnostic_status(False)
@@ -1364,7 +1604,7 @@ def main():
     if mode == "physics" and ("--sweep_dt" in arguments or "--report_sweep" in arguments):
         physics(arguments)
         return
-    if mode in ("check", "physics", "rollout") and (mode != "rollout" or "--single" in arguments) and "DREAMWAQ_DIAGNOSTIC_STATUS" not in os.environ:
+    if mode in ("check", "mixed-check", "physics", "rollout") and (mode != "rollout" or "--single" in arguments) and "DREAMWAQ_DIAGNOSTIC_STATUS" not in os.environ:
         import subprocess
         import tempfile
         with tempfile.TemporaryDirectory(prefix="dreamwaq_check_") as directory:
@@ -1376,6 +1616,9 @@ def main():
             passed = status.exists() and status.read_text() == "PASS"
             raise SystemExit(0 if passed else 1)
     register_tasks()
+    if mode == "mixed-check":
+        mixed_check(arguments)
+        return
     if mode == "check":
         check(arguments)
         return
@@ -1385,7 +1628,11 @@ def main():
     if mode == "rollout":
         rollout(arguments)
         return
-    task = f"Isaac-Velocity-Flat-Go2-DreamWaQ-Soft{'-Play' if mode != 'train' else ''}-v0"
+    mixed = mode.startswith("mixed-")
+    if mixed:
+        mode = mode.removeprefix("mixed-")
+    task = ("Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed" if mixed else
+            "Isaac-Velocity-Flat-Go2-DreamWaQ-Soft") + ("-Play" if mode != "train" else "") + "-v0"
     target = ROOT / "scripts/rollout_eval.py" if mode == "eval" else (
         Path(os.environ["ISAACLAB_PATH"]) / f"scripts/reinforcement_learning/rsl_rl/{mode}.py"
     )
