@@ -107,6 +107,203 @@ isaaclab.sh -p scripts/rollout_eval.py \
   --task Isaac-Velocity-Rough-Go2-DreamWaQ-Play-v0 --num_envs 1 --num_steps 500 --out ./figures
 ```
 
+## IsaacLab fast soil proxy (local installation)
+
+`soft-train`, `soft-play`, `soft-eval` and `soft-check` retain PhysX and the
+original DreamWaQ model, PPO settings, observation dimensions, action scaling and
+reward functions. The separate task initially uses **flat** soil: normal bearing,
+horizontal drag, shin/thigh resistance, pull-out resistance and footprint memory
+come from [newton-terrain's sand proxy](https://github.com/prakash-aryan/newton-terrain/blob/main/newton_terrain/sand_proxy.py).
+This is an approximate force model, not MPM or a deforming terrain mesh.
+
+The existing sibling checkout `../newton-terrain` supplies
+`newton_terrain/sand_proxy.py` and `runs/proxy_table.json`; set
+`NEWTON_TERRAIN_PATH` if it is elsewhere. Newton/MuJoCo need not be installed in
+the `dreamwaq` environment. The adapter supports Isaac Sim's bundled Warp 1.5.
+Source/table hashes and resolved coefficients are saved in each run's environment
+configuration.
+
+```bash
+# Short physics/contact/reset verification; does not train.
+bash scripts/isaac.sh soft-check --headless --num_envs 4 --steps 100
+
+# Physical acceptance: no policy, original joint targets, no automatic resets.
+bash scripts/isaac.sh soft-physics --headless --num_envs 4 --seconds 8
+# Matched rigid control; separate diagnostic run.
+bash scripts/isaac.sh soft-physics --headless --num_envs 4 --seconds 8 --rigid
+# Isolate bearing under imposed geometry (diagnostic joint constraints only).
+bash scripts/isaac.sh soft-physics --headless --num_envs 4 --seconds 8 --lock_joints
+# Paired timestep/velocity audit; 5, 2.5 and 1.25 ms, always 20 ms control.
+bash scripts/isaac.sh soft-physics --headless --num_envs 4 --seconds 8 --sweep_dt
+# Extend the convergence study without changing soil or actuator parameters.
+bash scripts/isaac.sh soft-physics --headless --num_envs 4 --seconds 8 \
+  --sweep_dt --sweep_dts 0.000625,0.0003125
+
+# Manual training with the migrated soil task; original learning algorithm/model.
+# Material/depth defaults remain f0.75 sand and 0.15 m.
+bash scripts/isaac.sh soft-train --headless --num_envs 2048 \
+  --max_iterations 2000 --seed 1 --run_name sand_f075_dt03125_seed1
+
+# Fine-tune the trained DreamWaQ rigid-ground model into a NEW soft run.
+# Loads actor, critic and CENet weights; optimizer and iteration counter start fresh.
+bash scripts/isaac.sh soft-train --headless --num_envs 2048 \
+  --max_iterations 2000 --seed 1 --run_name soft_finetune_from_rough_seed1 \
+  agent.init_checkpoint=/home/allvey/Projects/robotics/dreamwaq-isaaclab/logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1/model_1999.pt
+
+# Matched flat rigid control, with otherwise identical task/algorithm settings.
+bash scripts/isaac.sh soft-train --headless --num_envs 2048 \
+  --max_iterations 2000 --seed 1 --run_name rigid_dt03125_seed1 \
+  env.scene.terrain.soft_enabled=false \
+  agent.experiment_name=isaaclab/go2_dreamwaq_rigid_flat
+
+# View an explicitly selected checkpoint; may also use an existing rigid policy.
+bash scripts/isaac.sh soft-play --num_envs 4 --checkpoint /absolute/path/model_1999.pt
+```
+
+Soft runs go to `logs/rsl_rl/isaaclab/go2_dreamwaq_soft_flat/<run>/`;
+the control command uses `isaaclab/go2_dreamwaq_rigid_flat/<run>/` under the same
+root. Point TensorBoard at `logs/rsl_rl/`. Existing `train`, `play`, `eval` commands
+still use the original rough task. Compare the soft task with the matched flat
+control; historical rough-terrain runs have a different terrain distribution.
+`agent.init_checkpoint` initializes a new run from network weights, with the
+original PPO settings and a fresh optimizer/iteration counter. The source path is
+saved in `params/agent.yaml`. Do not combine it with `--resume True`, which resumes
+an existing run's optimizer and iteration state. Formal training is started manually.
+
+The nominal surface is at z=0 with no collider; PhysX's hard bottom is at z=-depth.
+Soil normal forces enter the existing contact sensor before history/air-time
+updates, including base-contact termination. Height scans see the nominal top,
+not footprint depressions. Memory is per environment and is cleared on reset.
+Tune physical parameters with Hydra, e.g. `env.scene.terrain.depth=0.10` or
+`env.scene.terrain.material=f0.9`, without changing model code.
+A passing short check verifies interfaces and finite physics, not locomotion
+performance or calibration to real soil.
+
+`soft-physics` checks bearing/moment balance, dissipative foot/shin/thigh drag,
+pull-out resistance, footprint reuse, ring-buffer wraparound, isolated resets,
+and actual PhysX force application using free-flight momentum balance. It then
+measures fixed-target standing and applies the same recorded thresholds to rigid
+and soft runs. Failure returns a nonzero exit code. Each new diagnostic run saves
+`env.yaml`, `summary.json`, `measurements.npz` and `physics.png` under
+`logs/rsl_rl/isaaclab/go2_dreamwaq_soft_physics/<run>/`.
+
+`--physics_dt` changes only a diagnostic run's timestep and synchronizes its
+decimation, rendering interval and contact sampling, retaining a 20 ms control
+period and height scan interval. The sweep verifies resolved configuration and
+startup-weight invariants across matched rigid/soft cases. Each case also saves
+joint/foot positions, reported velocities, position-difference velocities, world
+wrenches and horizontal-drag work estimates in `measurements.npz`, with a
+`velocity_audit.png` figure. Configuration-based and velocity-trapezoid work
+estimates are distinct diagnostics; neither alone is total-system energy balance.
+
+Saved sweeps can be combined with `--report_sweep <sweep_dir> [<sweep_dir> ...]`;
+this creates a new comparison report without rerunning physics or replacing old
+results. The report includes `comparison.json` and `dt_convergence.png`. A sweep
+returns nonzero if any case fails acceptance, including its deliberately retained
+5 ms baseline.
+
+The original 5 ms physics timestep passes the force-law checks but fails free-joint
+standing because of persistent leg oscillation; the rigid control passes.
+`--lock_joints` isolates bearing and does **not** certify free-joint stability.
+Experimental `--floor_stiffness`, `--normal_damping`, `--drag_damping_cap` and
+`--drag_scale` overrides are recorded per run. Trial values have not been adopted
+as training defaults. The network, PPO and actuator gains remain unchanged.
+
+The paired convergence audit (4 environments, seed 1, 8 seconds) reduced mean
+joint speed from 5.24 rad/s at 5 ms to 1.16 at 2.5 ms and 0.417 at 1.25 ms.
+Those cases failed the original standing criteria. At 0.625 ms the mean was
+0.133 rad/s and acceptance passed, although a small two-step oscillation remained.
+At 0.3125 ms it fell to 0.00348 rad/s and that oscillation disappeared; both
+corresponding rigid controls also passed. The resolved timestep was the only
+experimental setting varied, with dependent timing fields synchronized to
+retain 50 Hz control. This supports a discrete-coupling instability diagnosis.
+
+The migrated soft task and its matched flat rigid control default to 0.3125 ms
+and 64 physics substeps per control step. `soft-train`, `soft-play`, `soft-eval`,
+`soft-check` and the default `soft-physics` use this validated coupling timestep.
+The original rough task keeps its original timing. For RL/play, 48
+contact-history samples retain the original 15 ms window
+(3 samples at 5 ms); the standalone physics audit bypasses RL rewards and
+terminations. Proprioceptive history stays at 5 policy frames and 50 Hz.
+Static acceptance does not establish locomotion performance, multiple-seed
+robustness, or training throughput.
+
+An optional inference-only paired rollout measures frozen-policy transfer:
+
+```bash
+bash scripts/isaac.sh soft-rollout --headless --num_envs 4 \
+  --checkpoint logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1/model_1999.pt \
+  --phase_seconds 3 --cycles 2 --seeds 1,2,3
+```
+
+This runs fresh rigid/soft processes for each seed, with identical 0.3125 ms
+physics, 50 Hz control, 48 contact-history samples, the original play settings,
+and five command phases: stand, forward at 0.3 m/s, lateral at 0.2 m/s, turn at
+0.4 rad/s, and stand again. The example repeats the schedule for 30 seconds per
+case. Original episode timeouts and non-timeout termination rules remain active;
+states and termination reasons are captured **before** automatic resets. Soft
+resets also check footprint-memory clearing and isolation from other environments.
+The original CENet samples a latent even in inference; an isolated per-step Torch
+RNG gives each pair the same samples without changing the model or consuming the
+environment's random stream. Checkpoint and policy hashes verify frozen weights.
+
+Results go to `logs/rsl_rl/isaaclab/go2_dreamwaq_soft_rollout/<batch>/`, including
+each case's resolved environment/agent configuration, measurements, summary and
+the batch comparison plot/JSON. The report checks paired configuration, initial
+poses, masses, inertias, materials, actor observations and first actions. Initial
+privileged height scans allow 10 micrometres of ray-intersection rounding between
+the rigid plane and visual soil mesh; these scans do not enter the actor. Native
+joint positions and velocities are recorded at every physics substep so that
+50 Hz sampling cannot hide fast oscillations. Tracking metrics discard the first
+second of each phase; overall metrics retain every sample and every reset.
+Runtime includes diagnostic recording and is not a training-throughput estimate.
+Rebuild a report without repeating simulation with `soft-rollout --report <batch>`.
+Reports also summarize each phase before each environment's first reset, and
+separate terminations before/after the first timeout. Resume an interrupted batch
+using the same command plus `--resume --out <batch>`: completed matching cases
+are reused, while partial cases/logs are preserved in place and retried in new
+directories. Other output directories must be new. This evaluates transfer of a rigid-trained
+policy; poor soft-ground tracking alone does not establish a physics failure.
+
+The 3-seed audit (4 environments per case, 30 seconds, frozen `model_1999.pt`)
+passed configuration/initial-state parity and all 20 soft-memory reset checks.
+Before the first reset, mean forward speed under a 0.3 m/s command was 0.178 m/s
+on rigid ground and -0.013 m/s on soil; mean yaw rate under a 0.4 rad/s command
+was 0.390 and -0.068 rad/s respectively. Both lateral responses were weak.
+Neither group had a base-contact termination before its first 20-second timeout;
+after timeouts there were 12 rigid and 8 soft base-contact terminations. No
+pre-reset soft sample exceeded 5% body weight in hard-floor support, and the
+largest phase high-frequency joint-velocity power fraction was 0.029% (top 20%
+of the available frequency band). Frozen-policy tracking and post-reset recovery
+are transfer observations, not pass/fail criteria for migrating the soil model.
+Migration acceptance concerns force-law fidelity, PhysX wrench application,
+contact feedback, numerical stability and per-environment soil-state resets.
+Real-soil calibration and training throughput remain unvalidated.
+The saved batch is
+`logs/rsl_rl/isaaclab/go2_dreamwaq_soft_rollout/2026-10-22_23-22-45_467893_paired/`.
+
+To measure forgetting on the original rigid rough task, evaluate each checkpoint
+with the same seed and command schedule:
+
+```bash
+bash scripts/isaac.sh soft-rollout --single --original_rough --headless \
+  --num_envs 16 --phase_seconds 4 --cycles 2 --seed 1 \
+  --checkpoint /absolute/path/model_1999.pt
+```
+
+This selects the original `Isaac-Velocity-Rough-Go2-DreamWaQ-Play-v0` task,
+including its rough terrain generator, native 5 ms physics / 50 Hz control,
+3-sample contact history and clean Play observations. No soil adapter is used.
+Only the evaluation command schedule replaces the random velocity commands;
+the terrain mesh is seeded and hashed, and initial states/terrain assignments
+are saved for checking parity across checkpoints. Native episode termination,
+timeouts and terrain curriculum remain active; after resets the trajectories
+and terrain levels can diverge. Results go to
+`logs/rsl_rl/isaaclab/go2_dreamwaq_forgetting/<run>/`, including rewards,
+completed episode lengths, termination reasons and first-failure times.
+Add `--command_scale 2` to test 0.6 m/s forward, 0.4 m/s lateral and 0.8 rad/s
+yaw using the same schedule; use identical scales for both checkpoints.
+
 ## Verification
 
 Each component was gated on a pass/fail check before the next was built:
