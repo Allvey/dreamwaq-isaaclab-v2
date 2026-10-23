@@ -177,23 +177,63 @@ not footprint depressions. Memory is per environment and is cleared on reset.
 Tune physical parameters with Hydra, e.g. `env.scene.terrain.depth=0.10` or
 `env.scene.terrain.material=f0.9`, without changing model code.
 
-### Mixed original rough terrain and flat soil
+### Mixed original rough terrain and fixed soil scenarios
 
-`mixed-train` uses one policy and the original PPO update with fresh samples from
-both groups in every rollout. By default half the environments use the complete
-original rough terrain generator (including its original terrain proportions and
-difficulty curriculum); half use the current flat f0.75 soil at 0.15 m depth.
-Groups are fixed for a run. The soil patch is separate from the rough mesh;
-crossing a hard/soft boundary within an episode is not part of this first stage.
-Original rough triangles are retained, and the soil kernel's rigid-world branch
-adds no forces or footprint memory to rough environments. The nominal soil top
-has no collider; only the bottom at -depth collides. Height scans use the original
-rough geometry and the nominal soil top, excluding the bottom.
+`mixed-train` uses the original policy and PPO update. Half of the robots start
+on the original rough terrain and half on the added soil cells by default. The
+soil cells occupy the next **five +Y columns of the same grid**, with one shared
+outer border. Every cell is **8 x 8 m**; its **6 x 6 m** interior is surrounded
+by **1 m of flat rigid ground**, giving 2 m lanes between neighbouring interiors.
+The fixed scene types, in column order, are:
 
-The mixed scene shares the validated soil timestep of **0.3125 ms**, 64 substeps,
-50 Hz control and a 15 ms contact-history window. Historical original rough runs
-use 5 ms physics. They remain separate evaluation references; mixed-scene hard
-physics must not be described as identical to that historical timestep.
+| Column | Scenario | Fixed geometry |
+| --- | --- | --- |
+| 1 | `flat` | Flat uniform soil |
+| 2 | `mound` | Smooth 0.30 m hill |
+| 3 | `basin` | Smooth 0.20 m depression with walkable sides |
+| 4 | `undulating` | Windowed waves, amplitude parameter 0.10 m and wavelength 2 m |
+| 5 | `mixed` | Alternating 1 m soft/hard bands inside the cell |
+
+There are 10 identical rows per type in training, or 5 in the reduced play scene.
+**There is no soil curriculum or progression**: each row repeats the same fixed
+profile and material (`f0.75`). The original rough-terrain curriculum is retained.
+`soft_columns` selects the number of appended columns; `soft_scenarios` selects
+the ordered scenario list (cycled if more columns are requested). For a flat-only
+control use `env.scene.terrain.soft_columns=1` and
+`'env.scene.terrain.soft_scenarios=[flat]'` during training.
+`soft_fraction` still controls the number of soil-spawn robots independently of
+map area. Spawn sampling cycles across all types, then rows; soil memory remains
+isolated per robot. `soft_border`, `soft_resolution`, `soft_mound_height`,
+`soft_basin_depth`, `soft_wave_height`, `soft_wave_length` and `soft_stripe_width`
+are stored in the resolved configuration. Grid spacing defaults to 0.1 m.
+
+The rendered top, hidden critic scan and per-contact physical sampling use the
+same triangulated height grid. There is no rigid collider on a soft top: the
+collision bottom follows that profile at a vertical offset of -0.15 m. Hard frames
+and internal hard bands have real top colliders. The upstream spring, plastic
+yield, footprint, drag and pull-out equations are evaluated in a separate local
+tangent frame for each leg; forces/torques are rotated back to world coordinates.
+Belly contact uses its own surface sample. This is a gently curved surface proxy,
+not volumetric MPM or exact rod integration across curved/material boundaries.
+Flat-patch force parity, slope support direction and tangential dissipation are
+covered by `mixed-check`. The standalone flat-soil task retains its original
+horizontal kernel.
+
+Spawn groups label statistics only: robots from either group acquire soil forces
+when their feet enter a soft patch. Local-origin changes from the rough curriculum
+are accounted for. Original active-cell triangles are retained; only the flat
+perimeter is rebuilt around the extended grid. Source/active rough mesh and soil
+surface hashes are recorded. Use a new run name for this five-scenario variant.
+
+The mixed scene now defaults to the **32-substep speed experiment**: 0.625 ms
+physics, 50 Hz control and a 15 ms contact-history window (24 samples). Set
+`env.scene.terrain.physics_substeps=64` to select the converged 0.3125 ms reference
+(48 contact samples). This one selector resolves dt, decimation, render interval
+and contact sampling together after Hydra overrides. The standalone flat soil
+task retains its 64-substep default; historical original rough runs use 5 ms
+physics. Both remain separate evaluation references. Earlier 32-substep standing
+tests passed basic thresholds but retained high-frequency oscillation; record
+this as a distinct numerical experiment rather than an equivalent replacement.
 Network/CENet inputs, losses, PPO settings, rewards, commands and actuators are
 unchanged. Terrain curriculum applies only to the rough group; soft origins and
 per-environment soil memory remain isolated across resets.
@@ -201,24 +241,29 @@ per-environment soil memory remain isolated across resets.
 ```bash
 # Acceptance only: geometry, force/contact/reset isolation and one discarded
 # PPO update. No trained checkpoint is written and runner.learn is not called.
-bash scripts/isaac.sh mixed-check --headless --num_envs 8 --steps 100
+bash scripts/isaac.sh mixed-check --headless --num_envs 12 --steps 100
 
 # Start formal training MANUALLY from the original rough checkpoint.
 bash scripts/isaac.sh mixed-train --headless --num_envs 2048 \
-  --max_iterations 2000 --seed 1 --run_name rough_soft_50_50_seed1 \
+  --max_iterations 2000 --seed 1 --run_name rough_soil_scenarios_32substeps_seed1 \
+  env.scene.terrain.physics_substeps=32 \
   env.scene.terrain.soft_fraction=0.5 \
   agent.init_checkpoint=/home/allvey/Projects/robotics/dreamwaq-isaaclab/logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1/model_1999.pt
 
 # View the mixed task, initially following rough env 0 (at least two required).
-bash scripts/isaac.sh mixed-play --num_envs 8 --checkpoint /absolute/path/model.pt
+bash scripts/isaac.sh mixed-play --num_envs 12 --checkpoint /absolute/path/model.pt
+# Show the original terrain and all five soil scenario columns from above.
+bash scripts/isaac.sh mixed-play --overview --num_envs 12 --checkpoint /absolute/path/model.pt
 
-# Evaluate the SAME checkpoint separately on the historical native rough task
+# Evaluate two legacy references (these do not cover all five soil scenarios):
+# the SAME checkpoint on the historical native rough task
 # and on the current flat soil, with the same fixed commands and seed.
 bash scripts/isaac.sh soft-rollout --single --original_rough --headless \
   --num_envs 16 --seed 1 --phase_seconds 4 --cycles 2 \
   --checkpoint /absolute/path/model.pt
 bash scripts/isaac.sh soft-rollout --single --headless \
   --num_envs 16 --seed 1 --phase_seconds 4 --cycles 2 \
+  --physics_dt 0.000625 \
   --checkpoint /absolute/path/model.pt
 ```
 
@@ -227,8 +272,61 @@ Mixed checkpoints, TensorBoard events and resolved configurations are stored in
 rough mesh hash and actual rounded group sizes. TensorBoard's `Mixed/` series
 separate rough/soft reward per simulated second, termination/timeout fractions
 per step, and the actual soft sample fraction; these are not episode success
-rates. Use `logs/rsl_rl/` as the TensorBoard root. Evaluate multiple seeds before
+rates. `SoilScenario/` adds the same metrics per soil spawn type.
+Use `logs/rsl_rl/` as the TensorBoard root. Evaluate multiple seeds before
 selecting a checkpoint; combined training reward alone can hide standing drift.
+To continue an existing mixed checkpoint with optimizer state, use `--resume True
+--load_run <existing-run> --checkpoint model_<iteration>.pt` and a new `--run_name`
+containing `32substeps`; omit `agent.init_checkpoint`. The native runner writes a
+new run directory and treats `--max_iterations` as additional iterations after
+the loaded counter. Existing training processes retain their original timestep;
+they are never automatically stopped or restarted.
+
+### Sampling performance
+
+Soil state preparation reuses the existing body-state buffer and the original
+`quat_apply` expression for world COM positions. COM offsets are refreshed each
+control step and after resets, instead of querying PhysX's CPU COM buffer twice
+per physics substep. This is enabled by default for flat and mixed soil; use
+`env.scene.terrain.optimized=false` with `soft-train` or `mixed-train` to select
+the reference path. This computation optimization preserves whichever timing
+profile was selected, the soil force kernel, network and PPO settings.
+
+Use the same checkpoint, seed, environment count and timing counts for the pair:
+
+```bash
+bash scripts/isaac.sh mixed-profile --headless --reference \
+  --num_envs 2048 --substeps 32 --steps 24 --warmup 8 --profile_steps 2 \
+  --checkpoint /absolute/path/model.pt
+bash scripts/isaac.sh mixed-profile --headless \
+  --num_envs 2048 --substeps 32 --steps 24 --warmup 8 --profile_steps 2 \
+  --checkpoint /absolute/path/model.pt
+```
+
+Run performance measurements without another simulation/training process on the
+GPU. These commands run inference only, save no model and do not call the learning
+loop. Each writes `summary.json`, `env.yaml` and `agent.yaml` under
+`logs/rsl_rl/isaaclab/go2_dreamwaq_mixed_profile/<run>/`. Clean throughput timing
+synchronizes CUDA only at block boundaries. A separate component pass synchronizes
+all CUDA work around each call to include PhysX's other streams; this intentionally
+changes scheduling, so component times are not normal training throughput.
+Use `--substeps 64` for the earlier timing reference. When comparing 32 versus
+64 substeps, omit `--reference` on both so the adapter implementation matches.
+
+Exact trajectory/contact parity can be checked in fresh processes:
+
+```bash
+bash scripts/isaac.sh mixed-check --headless --reference --num_envs 8 --steps 100 \
+  --substeps 32 \
+  --record /tmp/dreamwaq_mixed_reference.npz
+bash scripts/isaac.sh mixed-check --headless --num_envs 12 --steps 100 \
+  --substeps 32 \
+  --compare /tmp/dreamwaq_mixed_reference.npz
+```
+
+The comparison covers both groups' root/joint states, rewards and contacts, plus
+soft wrenches, depth, footprint state, contact history and air time. These checks
+also discard one diagnostic PPO update; they never write a trained checkpoint.
 A passing short check verifies interfaces and finite physics, not locomotion
 performance or calibration to real soil.
 

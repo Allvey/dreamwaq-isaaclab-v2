@@ -16,7 +16,7 @@ def diagnostic_status(passed):
         Path(status).write_text("PASS" if passed else "FAIL")
 
 
-def register_tasks():
+def register_tasks(*, overview=False):
     # String entry points keep IsaacLab imports after AppLauncher.
     import gymnasium as gym
     for suffix, config in (("", "Go2SoftEnvCfg"), ("-Play", "Go2SoftPlayEnvCfg")):
@@ -31,7 +31,8 @@ def register_tasks():
             id=f"Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed{suffix}-v0",
             entry_point="soft_terrain:make_env", disable_env_checker=True,
             kwargs={"env_cfg_entry_point": f"soft_terrain:{config}",
-                    "rsl_rl_cfg_entry_point": "soft_terrain:Go2MixedRunnerCfg"},
+                    "rsl_rl_cfg_entry_point": "soft_terrain:Go2MixedRunnerCfg",
+                    "overview": overview},
         )
 
 
@@ -181,6 +182,152 @@ def check(arguments):
         app.close()
 
 
+def mixed_profile(arguments):
+    """Inference-only throughput and CUDA-synchronized component timing."""
+    import argparse
+    from isaaclab.app import AppLauncher
+
+    parser = argparse.ArgumentParser(description=mixed_profile.__doc__)
+    parser.add_argument("--num_envs", type=int, default=2048)
+    parser.add_argument("--steps", type=int, default=24)
+    parser.add_argument("--warmup", type=int, default=8)
+    parser.add_argument("--profile_steps", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--soft_fraction", type=float, default=0.5)
+    parser.add_argument("--soft_columns", type=int, default=5)
+    parser.add_argument("--substeps", type=int, choices=(32, 64), default=32)
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--reference", action="store_true", help="Use the original adapter implementation")
+    AppLauncher.add_app_launcher_args(parser)
+    args = parser.parse_args(arguments)
+    if min(args.num_envs, args.steps, args.warmup, args.profile_steps) < 1:
+        parser.error("Environment and step counts must be positive")
+    app, env = AppLauncher(args).app, None
+    try:
+        from datetime import datetime
+        import hashlib
+        import json
+        import time
+        import torch
+        import gymnasium as gym
+        import soft_terrain as soft
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+        from isaaclab.utils.io import dump_yaml
+
+        cfg = soft.Go2MixedEnvCfg()
+        cfg.scene.num_envs, cfg.seed, cfg.sim.device = args.num_envs, args.seed, args.device
+        cfg.scene.terrain.soft_fraction = args.soft_fraction
+        cfg.scene.terrain.soft_columns = args.soft_columns
+        cfg.scene.terrain.physics_substeps = args.substeps
+        soft.configure_soil_timing(cfg, substeps=args.substeps)
+        cfg.scene.terrain.optimized = not args.reference
+        cfg.scene.terrain.terrain_generator.seed = args.seed
+        env = RslRlVecEnvWrapper(gym.make("Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed-v0", cfg=cfg))
+        raw, policy = env.unwrapped, None
+        agent = soft.Go2MixedRunnerCfg()
+        if args.checkpoint:
+            agent.init_checkpoint = args.checkpoint
+            runner = soft.make_runner(env, agent.to_dict(), log_dir=None, device=env.device)
+            policy = runner.get_inference_policy(device=env.device)
+        obs = env.get_observations()
+        zero = torch.zeros((env.num_envs, 12), device=env.device)
+        def synchronize():
+            if str(env.device).startswith("cuda"):
+                torch.cuda.synchronize(env.device)
+        def advance():
+            nonlocal obs
+            with torch.inference_mode():
+                actions = policy(obs) if policy else zero
+                obs, reward, done, extras = env.step(actions)
+            return reward, done
+        for _ in range(args.warmup):
+            advance()
+        synchronize()
+        started = time.perf_counter()
+        for _ in range(args.steps):
+            advance()
+        synchronize()
+        elapsed = time.perf_counter() - started
+        print(f"[Mixed profile] clean throughput={env.num_envs * args.steps / elapsed:.1f} steps/s; "
+              f"{args.steps} control steps in {elapsed:.3f}s", flush=True)
+        # Component timings intentionally serialize CUDA. Keep these separate
+        # from the clean throughput above; PhysX may use non-Torch CUDA streams.
+        totals, originals = {}, []
+        def instrument(obj, name, label):
+            native = getattr(obj, name)
+            totals[label] = {"calls": 0, "seconds": 0.0}
+            def measured(*positional, **keywords):
+                synchronize()
+                before = time.perf_counter()
+                value = native(*positional, **keywords)
+                synchronize()
+                totals[label]["seconds"] += time.perf_counter() - before
+                totals[label]["calls"] += 1
+                return value
+            originals.append((obj, name, native))
+            setattr(obj, name, measured)
+        soil = raw.action_manager.get_term("joint_pos").soil
+        instrument(soil, "prepare_state", "soil_state_read_and_pack")
+        instrument(soil, "evaluate", "soil_force_and_contact_calculation")
+        instrument(soil, "apply_wrench", "soil_wrench_submission")
+        instrument(raw.scene["contact_forces"], "_update_buffers_impl", "contact_sensor_history_and_timers")
+        instrument(raw.scene, "write_data_to_sim", "actuator_and_scene_submission")
+        instrument(raw.sim, "step", "physx_step")
+        try:
+            synchronize()
+            started = time.perf_counter()
+            for _ in range(args.profile_steps):
+                advance()
+            synchronize()
+            profile_elapsed = time.perf_counter() - started
+        finally:
+            for obj, name, native in originals:
+                setattr(obj, name, native)
+        for value in totals.values():
+            value["ms_per_call"] = 1000 * value["seconds"] / max(value["calls"], 1)
+            value["serialized_wall_fraction"] = value["seconds"] / profile_elapsed
+        output = ROOT / "logs/rsl_rl/isaaclab/go2_dreamwaq_mixed_profile" / (
+            datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f") + ("_reference" if args.reference else "_optimized")
+        )
+        output.mkdir(parents=True, exist_ok=False)
+        dump_yaml(str(output / "env.yaml"), cfg)
+        dump_yaml(str(output / "agent.yaml"), agent)
+        summary = {"completed": True, "inference_only": True, "seed": args.seed,
+                   "backend": "isaaclab", "task": "Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed-v0",
+                   "optimized": not args.reference, "num_envs": env.num_envs,
+                   "torch_version": torch.__version__,
+                   "device_name": torch.cuda.get_device_name(env.device) if str(env.device).startswith("cuda") else "CPU",
+                   "warmup_control_steps": args.warmup, "measured_control_steps": args.steps,
+                   "physics_dt": cfg.sim.dt, "decimation": cfg.decimation, "control_period_s": raw.step_dt,
+                   "rough_mesh_sha256": cfg.scene.terrain.rough_mesh_sha256,
+                   "soft_surface_sha256": cfg.scene.terrain.soft_surface_sha256,
+                   "soft_scenarios": cfg.scene.terrain.resolved_soft_scenarios,
+                   "adapter_sha256": cfg.scene.terrain.adapter_sha256,
+                   "checkpoint": str(Path(args.checkpoint).resolve()) if args.checkpoint else None,
+                   "checkpoint_sha256": hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest() if args.checkpoint else None,
+                   "clean_wall_seconds": elapsed, "clean_steps_per_second": env.num_envs * args.steps / elapsed,
+                   "serialized_profile_control_steps": args.profile_steps,
+                   "serialized_profile_wall_seconds": profile_elapsed, "components": totals,
+                   "timing_note": "Clean timing synchronizes only at block boundaries; component timing synchronizes "
+                                  "all CUDA work around each call and changes scheduling. Includes policy inference when supplied; "
+                                  "no learning, checkpoint save, or per-step CPU diagnostic copies."}
+        (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        for label, value in sorted(totals.items(), key=lambda pair: -pair[1]["seconds"]):
+            print(f"[Mixed profile] {label}: {value['ms_per_call']:.3f} ms/call; "
+                  f"{100 * value['serialized_wall_fraction']:.1f}% serialized wall", flush=True)
+        print(f"[MIXED PROFILE PASS] {output}", flush=True)
+        diagnostic_status(True)
+    except Exception:
+        diagnostic_status(False)
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        if env is not None:
+            env.close()
+        app.close()
+
+
 def mixed_check(arguments):
     """Mixed geometry/force/reset and disposable PPO-update acceptance; no saved policy."""
     import argparse
@@ -191,10 +338,14 @@ def mixed_check(arguments):
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--soft_fraction", type=float, default=0.5)
+    parser.add_argument("--soft_columns", type=int, default=5)
+    parser.add_argument("--play_scene", action="store_true", help="Check the same reduced terrain/config used by mixed-play")
+    parser.add_argument("--substeps", type=int, choices=(32, 64), default=32)
     parser.add_argument("--checkpoint", help="Optional weights to verify exact warm start")
     parser.add_argument("--no_adapter", action="store_true", help="Diagnostic rigid-group reference only")
-    parser.add_argument("--record", help="Optional rigid-group state archive for paired acceptance")
-    parser.add_argument("--compare", help="Require exact rigid-group equality to --no_adapter archive")
+    parser.add_argument("--reference", action="store_true", help="Use the original adapter for an exact paired comparison")
+    parser.add_argument("--record", help="Optional two-group state/contact archive for paired acceptance")
+    parser.add_argument("--compare", help="Require exact equality to a reference archive (legacy rough-only archives supported)")
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args(arguments)
     if args.num_envs < 4 or args.steps < 50:
@@ -214,11 +365,15 @@ def mixed_check(arguments):
         from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
         from isaaclab.utils.warp import raycast_mesh
 
-        cfg = soft.Go2MixedEnvCfg()
+        cfg = soft.Go2MixedPlayEnvCfg() if args.play_scene else soft.Go2MixedEnvCfg()
         cfg.scene.num_envs, cfg.seed, cfg.sim.device = args.num_envs, args.seed, args.device
         cfg.scene.terrain.soft_fraction = args.soft_fraction
+        cfg.scene.terrain.soft_columns = args.soft_columns
+        cfg.scene.terrain.physics_substeps = args.substeps
+        soft.configure_soil_timing(cfg, substeps=args.substeps)
+        cfg.scene.terrain.optimized = not args.reference
         cfg.scene.terrain.terrain_generator.seed = args.seed
-        baseline = soft.Go2DreamWaQRoughEnvCfg()
+        baseline = soft.Go2DreamWaQRoughEnvCfg_PLAY() if args.play_scene else soft.Go2DreamWaQRoughEnvCfg()
         for name in ("observations", "rewards", "terminations", "events", "commands"):
             assert getattr(cfg, name).to_dict() == getattr(baseline, name).to_dict(), name
         assert cfg.actions.to_dict() == baseline.actions.to_dict()
@@ -232,9 +387,22 @@ def mixed_check(arguments):
         raw = env.unwrapped
         terrain, robot, sensor = raw.scene.terrain, raw.scene["robot"], raw.scene["contact_forces"]
         soil = raw.action_manager.get_term("joint_pos").soil
+        if cfg.scene.terrain.optimized:
+            soil.prepare_state()
+            prepared = [value.clone() for value in (soil.q, soil.qd, soil.world_com)]
+            cfg.scene.terrain.optimized = False
+            soil.prepare_state()
+            for actual, expected in zip((soil.q, soil.qd, soil.world_com), prepared):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            cfg.scene.terrain.optimized = True
+            print("[Mixed check] optimized state packing and world COM match original exactly", flush=True)
         rigid, sand = ~terrain.soft_mask, terrain.soft_mask
         assert rigid.any() and sand.any()
         assert terrain.num_soft == round(args.num_envs * args.soft_fraction)
+        coverage = torch.stack(list(terrain.scenario_masks.values())).int().sum(0, dtype=torch.int32)
+        torch.testing.assert_close(coverage, sand.int())
+        if terrain.num_soft >= args.soft_columns:
+            assert set(terrain.scenario_masks) == set(terrain.soft_scenario_names)
         original_origins = terrain.env_origins.clone()
         mesh = terrain.meshes["terrain"]
         assert hashlib.sha256(mesh.vertices.tobytes() + mesh.faces.tobytes()).hexdigest() == cfg.scene.terrain.rough_mesh_sha256
@@ -247,8 +415,14 @@ def mixed_check(arguments):
         if cuda_state:
             torch.cuda.set_rng_state_all(terrain._rough_cuda_state)
         reference = TerrainGenerator(cfg=baseline.scene.terrain.terrain_generator.replace(seed=args.seed), device=env.device)
-        np.testing.assert_array_equal(reference.terrain_mesh.vertices, mesh.vertices)
-        np.testing.assert_array_equal(reference.terrain_mesh.faces, mesh.faces)
+        source_mesh = reference.terrain_mesh
+        assert hashlib.sha256(source_mesh.vertices.tobytes() + source_mesh.faces.tobytes()).hexdigest() == cfg.scene.terrain.source_rough_mesh_sha256
+        gen = cfg.scene.terrain.terrain_generator
+        half = np.array(gen.size) * [gen.num_rows, gen.num_cols] / 2
+        active = (np.abs(source_mesh.triangles[:, :, :2]) <= half + 1e-6).all(axis=(1, 2))
+        np.testing.assert_array_equal(source_mesh.triangles[active], mesh.triangles)
+        assert np.allclose(source_mesh.triangles[~active, :, 2], 0.0, atol=1e-6)
+        print("[Mixed check] original active-cell triangles unchanged; only outer border relocated", flush=True)
         np.random.set_state(np_state)
         torch.set_rng_state(torch_state)
         if cuda_state:
@@ -261,28 +435,144 @@ def mixed_check(arguments):
         for path in ("/World/soil_surface", "/World/mixed_height_scan"):
             for prim in Usd.PrimRange(stage.GetPrimAtPath(path)):
                 assert not prim.HasAPI(UsdPhysics.CollisionAPI), path
-        # The soft patch is outside the entire original rough mesh, including its border.
-        assert float(terrain.soft_bounds[1, 0]) < mesh.bounds[0, 0]
-        query = terrain.env_origins.clone()
-        query[:, 2] += 5
-        direction = torch.zeros_like(query)
-        direction[:, 2] = -1
-        nominal = raycast_mesh(query, direction, raw.scene["height_scanner"].meshes["/World/mixed_height_scan"])[0]
-        bottom = raycast_mesh(query[sand], direction[sand], terrain.warp_meshes["soil_bottom"])[0]
-        torch.testing.assert_close(nominal[sand, 2], torch.zeros_like(nominal[sand, 2]), atol=1e-5, rtol=0)
-        torch.testing.assert_close(bottom[:, 2], torch.full_like(bottom[:, 2], -cfg.scene.terrain.depth), atol=1e-5, rtol=0)
-        rough_hits = raycast_mesh(query[rigid], direction[rigid], terrain.warp_meshes["terrain"])[0]
-        torch.testing.assert_close(nominal[rigid], rough_hits, rtol=0, atol=1e-5)
+        # All five fixed profiles share the original cell lattice and hard frames.
+        generator = cfg.scene.terrain.terrain_generator
+        sx, sy = generator.size
+        border = cfg.scene.terrain.soft_border
+        assert float(terrain.soft_bounds[0, 1]) == generator.num_cols * sy / 2
+        assert cfg.scene.terrain.resolved_soft_tiles == generator.num_rows * args.soft_columns
+        tiles = list(stage.GetPrimAtPath("/World/soil_surface").GetChildren())
+        assert len(tiles) == cfg.scene.terrain.resolved_soft_tiles
+        torch.testing.assert_close(terrain.env_origins[sand], terrain.soft_tile_origins[terrain.soft_tile_ids])
+        expected_x = (torch.arange(generator.num_rows, device=env.device) + 0.5 - generator.num_rows / 2) * sx
+        torch.testing.assert_close(terrain.soft_tile_origins[:, 0].reshape(-1, args.soft_columns)[:, 0], expected_x)
+        expected_y = (generator.num_cols / 2 + torch.arange(args.soft_columns, device=env.device) + 0.5) * sy
+        torch.testing.assert_close(terrain.soft_tile_origins[:, 1].reshape(-1, args.soft_columns)[0], expected_y)
+        scan_mesh = raw.scene["height_scanner"].meshes["/World/mixed_height_scan"]
 
-        # Identical buried fixtures in both groups must produce force/memory in SOFT only.
-        soil.q.zero_()
-        soil.q[..., 2], soil.q[..., 6] = 0.5, 1
-        soil.q[:, soil.feet, 2] = soil.proxy.R_FOOT - 0.02
-        soil.qd.zero_()
+        def downward(points, mesh, normals=False):
+            query = points.clone()
+            query[..., 2] = 5
+            direction = torch.zeros_like(query)
+            direction[..., 2] = -1
+            return raycast_mesh(query, direction, mesh, return_normal=normals)
+
+        # Compare the physical sampler with rendered/critic triangles, including
+        # off-grid points on slopes; compare the actual collision bottom as well.
+        offsets = torch.tensor([[0, 0], [0.637, 0.173], [-0.843, 0.327], [1.217, -0.283]], device=env.device)
+        probes = terrain.soft_tile_origins[:, None].repeat(1, len(offsets), 1)
+        probes[..., :2] += offsets
+        probes = probes.reshape(-1, 3)
+        height, normal, active = terrain.sample_surface(probes)
+        hits, _, face_normal, _ = downward(probes, scan_mesh, True)
+        torch.testing.assert_close(hits[:, 2], height, rtol=0, atol=2e-5)
+        torch.testing.assert_close(face_normal, normal, rtol=0, atol=2e-4)
+        bottom = downward(probes, terrain.warp_meshes["soil_bottom"])[0]
+        torch.testing.assert_close(bottom[active.bool(), 2], height[active.bool()] - cfg.scene.terrain.depth, rtol=0, atol=2e-5)
+        assert not torch.isfinite(bottom[~active.bool()]).all(-1).any()
+        for key in ("terrain", "soil_rim"):
+            hit = downward(probes, terrain.warp_meshes[key])[0]
+            assert not torch.isfinite(hit[active.bool()]).all(-1).any(), f"Rigid {key} covers sand"
+
+        offsets = torch.tensor([[sx / 2 - border / 2, 0], [-sx / 2 + border / 2, 0],
+                                [0, sy / 2 - border / 2], [0, -sy / 2 + border / 2],
+                                [sx / 2, 0], [0, sy / 2]], device=env.device)
+        frames = terrain.soft_tile_origins[:, None].repeat(1, len(offsets), 1)
+        frames[..., :2] += offsets
+        frames = frames.reshape(-1, 3)
+        fh, fn, fa = terrain.sample_surface(frames)
+        assert fa.count_nonzero() == 0
+        torch.testing.assert_close(fh, torch.zeros_like(fh), rtol=0, atol=1e-6)
+        for ray_mesh in (scan_mesh, terrain.warp_meshes["soil_rim"]):
+            hit = downward(frames, ray_mesh)[0]
+            torch.testing.assert_close(hit[:, 2], torch.zeros_like(hit[:, 2]), rtol=0, atol=2e-5)
+        # Native rough height scan geometry stays unchanged.
+        nominal = downward(terrain.env_origins[rigid], scan_mesh)[0]
+        reference_hits = downward(terrain.env_origins[rigid], terrain.warp_meshes["terrain"])[0]
+        torch.testing.assert_close(nominal, reference_hits, rtol=0, atol=1e-5)
+        print("[Mixed check] all scenario heights/normals match mesh rays; bottoms, hard lanes and collider holes verified", flush=True)
+
+        rough_id = int(rigid.nonzero()[0, 0])
+        def fixture(world_point, depth=0.02):
+            soil.reset()
+            soil.prepare_state()
+            soil.q.zero_()
+            soil.q[..., 2], soil.q[..., 6] = 2.0, 1.0
+            soil.qd.zero_()
+            h, n, enabled = terrain.sample_surface(world_point[None])
+            assert enabled.item() == 1
+            local = world_point - raw.scene.env_origins[rough_id]
+            local[2] = h[0] - raw.scene.env_origins[rough_id, 2]
+            soil.q[rough_id, :, :3] = local
+            soil.q[rough_id, :, 2] += 0.5
+            soil.q[rough_id, soil.feet, 2] = local[2] + (soil.proxy.R_FOOT - depth) / n[0, 2]
+            soil.evaluate()
+            torch.testing.assert_close(soil.depth[rough_id], torch.full_like(soil.depth[rough_id], depth), rtol=0, atol=1e-5)
+            assert (soil.normal_w[rough_id, soil.feet, 2] > 1).all()
+            return n[0]
+
+        # Force direction and dissipative tangential drag on every scenario,
+        # including a rough-spawn robot at a nonzero local origin/height.
+        for col, scenario in enumerate(terrain.soft_scenario_names):
+            point = terrain.soft_tile_origins[col].clone()
+            if scenario in ("mound", "basin", "undulating"):
+                point[:2] += torch.tensor([0.637, 0.173], device=env.device)
+            n = fixture(point)
+            force = soil.wrench[rough_id, soil.calves, :3].clone()
+            tangent_force = force - (force * n).sum(-1, keepdim=True) * n
+            torch.testing.assert_close(tangent_force, torch.zeros_like(tangent_force), rtol=0, atol=2e-4)
+            if scenario in ("mound", "basin", "undulating"):
+                assert torch.linalg.vector_norm(n[:2]) > 0.01
+            tangent = torch.linalg.cross(n, torch.tensor([0., 1., 0.], device=env.device))
+            tangent = 0.2 * tangent / torch.linalg.vector_norm(tangent)
+            soil.qd[rough_id, soil.feet, :3] = tangent
+            soil.evaluate()
+            assert ((soil.wrench[rough_id, soil.calves, :3] * tangent).sum(-1) < 0).all()
+            print(f"[Mixed check] {scenario}: 2 cm normal penetration, normal support and dissipative drag passed", flush=True)
+
+        # A flat mapped patch must reproduce the original flat proxy equations.
+        if "flat" in terrain.soft_scenario_names:
+            point = terrain.soft_tile_origins[terrain.soft_scenario_names.index("flat")].clone()
+            fixture(point)
+            actual = [value[rough_id].clone() for value in (soil.wrench, soil.normal_w, soil.mem)]
+            mapped, bounds = soil.surface_terrain, soil.local_soft_bounds
+            soil.reset()
+            soil.surface_terrain, soil.local_soft_bounds = None, None
+            soil.evaluate()
+            # The legacy rough-group reporter clears virtual contacts; compare
+            # the physical wrench/memory directly before restoring the mapped mode.
+            torch.testing.assert_close(soil.wrench[rough_id], actual[0], rtol=2e-5, atol=2e-4)
+            soil.surface_terrain, soil.local_soft_bounds = mapped, bounds
+            print("[Mixed check] flat mapped force law matches the original proxy", flush=True)
+
+        if "mixed" in terrain.soft_scenario_names:
+            point = terrain.soft_tile_origins[terrain.soft_scenario_names.index("mixed")].clone()
+            fixture(point)
+            soil.q[rough_id, soil.feet[2:], 0] += cfg.scene.terrain.soft_stripe_width
+            soil.evaluate()
+            assert (soil.normal_w[rough_id, soil.feet[:2], 2] > 1).all()
+            assert soil.normal_w[rough_id, soil.feet[2:]].count_nonzero() == 0
+            assert (soil.mem[rough_id, 2:] == -1).all()
+            # Belly support is independent of which material the first foot sees.
+            soil.q[rough_id, soil.feet[:2], 0] += cfg.scene.terrain.soft_stripe_width
+            soil.q[rough_id, soil.base, 2] = -raw.scene.env_origins[rough_id, 2] + 0.04
+            soil.evaluate()
+            assert soil.normal_w[rough_id, soil.feet].count_nonzero() == 0
+            assert soil.normal_w[rough_id, soil.base, 2] > 1
+            print("[Mixed check] straddling hard/soft bands and independent belly contact passed", flush=True)
+        # Hard frames must not generate proxy forces or footprints for either group.
+        soil.reset()
+        soil.q[..., 2] = -0.01
+        soil.q[..., 0] = sx / 2 - border / 2
+        soil.prepare_state()
+        for env_id in range(env.num_envs):
+            point = terrain.soft_tile_origins[0].clone()
+            point[0] += sx / 2 - border / 2
+            point[2] = -0.01
+            soil.q[env_id, :, :3] = point - raw.scene.env_origins[env_id]
         soil.evaluate()
-        assert soil.wrench[rigid].count_nonzero() == 0 and soil.normal_w[rigid].count_nonzero() == 0
-        assert (soil.mem[rigid] == -1).all() and soil.hole_n[rigid].count_nonzero() == 0
-        assert (soil.normal_w[sand][:, soil.feet, 2] > 1).all()
+        assert soil.wrench.count_nonzero() == 0 and soil.normal_w.count_nonzero() == 0
+        assert (soil.mem == -1).all() and soil.hole_n.count_nonzero() == 0
         soil.reset()
         if args.no_adapter:
             # Same scene, native action implementation; soft robots can fall.
@@ -291,6 +581,8 @@ def mixed_check(arguments):
             term.apply_actions = lambda: JointPositionAction.apply_actions(term)
 
         records = {name: [] for name in ("root", "joint", "contact", "reward")}
+        soil_records = {name: [] for name in ("soil_root", "soil_joint", "soil_contact", "soil_reward",
+                                             "soil_wrench", "soil_depth", "soil_mem", "soil_air", "soil_history")}
         max_soft_depth, soft_contact_steps = 0.0, 0
         zero = torch.zeros((env.num_envs, 12), device=env.device)
         for step in range(args.steps):
@@ -300,9 +592,12 @@ def mixed_check(arguments):
                 assert obs[name].shape == (env.num_envs, width) and torch.isfinite(obs[name]).all(), name
             assert torch.isfinite(robot.data.root_state_w).all() and torch.isfinite(reward).all()
             assert abs(float(extras["log"]["Mixed/soft_sample_fraction"]) - terrain.num_soft / args.num_envs) < 1e-6
+            for scenario in terrain.scenario_masks:
+                assert torch.isfinite(extras["log"][f"SoilScenario/{scenario}_reward_per_second"])
             if not args.no_adapter:
+                # Group labels determine sampling, not contact material. These
+                # short rough trajectories stay within the original cells.
                 assert soil.wrench[rigid].count_nonzero() == 0 and soil.normal_w[rigid].count_nonzero() == 0
-                assert (soil.mem[rigid] == -1).all() and soil.hole_n[rigid].count_nonzero() == 0
                 assert torch.isfinite(soil.wrench).all()
                 max_soft_depth = max(max_soft_depth, float(soil.depth[sand].max()))
                 soft_contact_steps += int((soil.normal_w[sand][:, soil.feet, 2] > 1).any())
@@ -313,16 +608,33 @@ def mixed_check(arguments):
                 torch.testing.assert_close(merged[sand], (physical + soil.normal_w[:, sensor.robot_body_ids])[sand])
             for name, value in zip(records, (robot.data.root_state_w, robot.data.joint_pos, sensor.data.net_forces_w, reward)):
                 records[name].append(value[rigid].cpu().numpy().copy())
+            if args.record or args.compare:
+                values = (robot.data.root_state_w[sand], robot.data.joint_pos[sand], sensor.data.net_forces_w[sand],
+                          reward[sand], soil.wrench[sand], soil.depth[sand], soil.mem[sand],
+                          sensor.data.current_air_time[sand], sensor.data.net_forces_w_history[sand])
+                for name, value in zip(soil_records, values):
+                    soil_records[name].append(value.cpu().numpy().copy())
         if args.record:
-            np.savez_compressed(args.record, **{name: np.stack(value) for name, value in records.items()},
-                                origins=original_origins.cpu().numpy(), rough_mesh_sha256=cfg.scene.terrain.rough_mesh_sha256)
+            np.savez_compressed(args.record, **{name: np.stack(value) for name, value in {**records, **soil_records}.items()},
+                                origins=original_origins.cpu().numpy(), rough_mesh_sha256=cfg.scene.terrain.rough_mesh_sha256,
+                                soft_surface_sha256=cfg.scene.terrain.soft_surface_sha256,
+                                physics_dt=cfg.sim.dt, decimation=cfg.decimation)
         if args.compare:
             with np.load(args.compare) as reference:
+                if "decimation" in reference:
+                    assert int(reference["decimation"]) == cfg.decimation and float(reference["physics_dt"]) == cfg.sim.dt, "Reference timing differs; select matching --substeps"
                 assert str(reference["rough_mesh_sha256"]) == cfg.scene.terrain.rough_mesh_sha256
+                if "soft_surface_sha256" in reference:
+                    assert str(reference["soft_surface_sha256"]) == cfg.scene.terrain.soft_surface_sha256
                 np.testing.assert_array_equal(reference["origins"], original_origins.cpu().numpy())
                 for name, value in records.items():
                     np.testing.assert_array_equal(np.stack(value), reference[name], err_msg=name)
             print("[Mixed check] rough trajectories match native-action reference bit for bit", flush=True)
+            with np.load(args.compare) as reference:
+                if "soil_root" in reference:
+                    for name, value in soil_records.items():
+                        np.testing.assert_array_equal(np.stack(value), reference[name], err_msg=name)
+                    print("[Mixed check] soft trajectories, wrenches, memory, contact history and air time match bit for bit", flush=True)
         if not args.no_adapter:
             assert soft_contact_steps > 0 and max_soft_depth > 0
             # A curriculum update containing both groups must only move rough IDs.
@@ -334,6 +646,10 @@ def mixed_check(arguments):
             torch.testing.assert_close(terrain.terrain_levels[sand], levels[sand], rtol=0, atol=0)
             unsaturated = rigid & (levels + 1 < terrain.max_terrain_level)
             assert (terrain.terrain_levels[unsaturated] == levels[unsaturated] + 1).all()
+            soil.prepare_state()
+            torch.testing.assert_close(soil.local_soft_bounds,
+                                       terrain.soft_bounds[None] - raw.scene.env_origins[:, None, :2])
+            torch.testing.assert_close(soil.surface_heights, -raw.scene.env_origins[:, 2])
             terrain.terrain_levels.copy_(levels)
             terrain.env_origins.copy_(origins)
             # Exercise the real reset/curriculum path with one ID from each group.
@@ -401,6 +717,7 @@ def mixed_check(arguments):
             # Discard the update; no checkpoint or training run is written.
             policy.load_state_dict(before)
         print(f"[MIXED CHECK PASS] rough={terrain.num_rough} soft={terrain.num_soft} "
+              f"substeps={cfg.decimation} dt={cfg.sim.dt} "
               f"steps={args.steps} soft_contact_steps={soft_contact_steps} max_soft_depth={max_soft_depth:.4f} m", flush=True)
         diagnostic_status(True)
     except Exception:
@@ -1604,7 +1921,7 @@ def main():
     if mode == "physics" and ("--sweep_dt" in arguments or "--report_sweep" in arguments):
         physics(arguments)
         return
-    if mode in ("check", "mixed-check", "physics", "rollout") and (mode != "rollout" or "--single" in arguments) and "DREAMWAQ_DIAGNOSTIC_STATUS" not in os.environ:
+    if mode in ("check", "mixed-check", "mixed-profile", "physics", "rollout") and (mode != "rollout" or "--single" in arguments) and "DREAMWAQ_DIAGNOSTIC_STATUS" not in os.environ:
         import subprocess
         import tempfile
         with tempfile.TemporaryDirectory(prefix="dreamwaq_check_") as directory:
@@ -1615,7 +1932,13 @@ def main():
                 raise SystemExit(child.returncode if child.returncode >= 0 else 128 - child.returncode)
             passed = status.exists() and status.read_text() == "PASS"
             raise SystemExit(0 if passed else 1)
-    register_tasks()
+    overview = mode == "mixed-play" and "--overview" in arguments
+    if overview:
+        arguments.remove("--overview")
+    register_tasks(overview=overview)
+    if mode == "mixed-profile":
+        mixed_profile(arguments)
+        return
     if mode == "mixed-check":
         mixed_check(arguments)
         return
