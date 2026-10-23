@@ -16,7 +16,7 @@ def diagnostic_status(passed):
         Path(status).write_text("PASS" if passed else "FAIL")
 
 
-def register_tasks(*, overview=False):
+def register_tasks(*, overview=False, stage=None):
     # String entry points keep IsaacLab imports after AppLauncher.
     import gymnasium as gym
     for suffix, config in (("", "Go2SoftEnvCfg"), ("-Play", "Go2SoftPlayEnvCfg")):
@@ -32,7 +32,7 @@ def register_tasks(*, overview=False):
             entry_point="soft_terrain:make_env", disable_env_checker=True,
             kwargs={"env_cfg_entry_point": f"soft_terrain:{config}",
                     "rsl_rl_cfg_entry_point": "soft_terrain:Go2MixedRunnerCfg",
-                    "overview": overview},
+                    "overview": overview, "stage": stage},
         )
 
 
@@ -195,7 +195,8 @@ def mixed_profile(arguments):
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--soft_fraction", type=float, default=0.5)
     parser.add_argument("--soft_columns", type=int, default=5)
-    parser.add_argument("--substeps", type=int, choices=(32, 64), default=32)
+    parser.add_argument("--stage", choices=("mixed", "hard", "soft"), default="mixed")
+    parser.add_argument("--substeps", type=int, choices=(4, 32, 64), default=32)
     parser.add_argument("--checkpoint")
     parser.add_argument("--reference", action="store_true", help="Use the original adapter implementation")
     AppLauncher.add_app_launcher_args(parser)
@@ -217,6 +218,7 @@ def mixed_profile(arguments):
         cfg = soft.Go2MixedEnvCfg()
         cfg.scene.num_envs, cfg.seed, cfg.sim.device = args.num_envs, args.seed, args.device
         cfg.scene.terrain.soft_fraction = args.soft_fraction
+        cfg.scene.terrain.training_stage = args.stage
         cfg.scene.terrain.soft_columns = args.soft_columns
         cfg.scene.terrain.physics_substeps = args.substeps
         soft.configure_soil_timing(cfg, substeps=args.substeps)
@@ -266,10 +268,11 @@ def mixed_profile(arguments):
                 return value
             originals.append((obj, name, native))
             setattr(obj, name, measured)
-        soil = raw.action_manager.get_term("joint_pos").soil
-        instrument(soil, "prepare_state", "soil_state_read_and_pack")
-        instrument(soil, "evaluate", "soil_force_and_contact_calculation")
-        instrument(soil, "apply_wrench", "soil_wrench_submission")
+        soil = getattr(raw.action_manager.get_term("joint_pos"), "soil", None)
+        if soil is not None:
+            instrument(soil, "prepare_state", "soil_state_read_and_pack")
+            instrument(soil, "evaluate", "soil_force_and_contact_calculation")
+            instrument(soil, "apply_wrench", "soil_wrench_submission")
         instrument(raw.scene["contact_forces"], "_update_buffers_impl", "contact_sensor_history_and_timers")
         instrument(raw.scene, "write_data_to_sim", "actuator_and_scene_submission")
         instrument(raw.sim, "step", "physx_step")
@@ -295,6 +298,7 @@ def mixed_profile(arguments):
         summary = {"completed": True, "inference_only": True, "seed": args.seed,
                    "backend": "isaaclab", "task": "Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed-v0",
                    "optimized": not args.reference, "num_envs": env.num_envs,
+                   "training_stage": cfg.scene.terrain.training_stage,
                    "torch_version": torch.__version__,
                    "device_name": torch.cuda.get_device_name(env.device) if str(env.device).startswith("cuda") else "CPU",
                    "warmup_control_steps": args.warmup, "measured_control_steps": args.steps,
@@ -328,6 +332,129 @@ def mixed_profile(arguments):
         app.close()
 
 
+def stage_check(arguments):
+    """Validate stage confinement, timing and checkpoint/optimizer continuity; no formal training."""
+    import argparse
+    from isaaclab.app import AppLauncher
+    parser = argparse.ArgumentParser(description=stage_check.__doc__)
+    parser.add_argument("--stage", choices=("hard", "soft"), required=True)
+    parser.add_argument("--substeps", type=int, choices=(4, 32, 64), default=32)
+    parser.add_argument("--num_envs", type=int, default=12)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--checkpoint")
+    AppLauncher.add_app_launcher_args(parser)
+    args = parser.parse_args(arguments)
+    if args.num_envs < 5 or args.steps < 20:
+        parser.error("Use at least five environments and 20 steps")
+    app, env = AppLauncher(args).app, None
+    try:
+        import torch
+        import gymnasium as gym
+        import soft_terrain as soft
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+        cfg = soft.Go2MixedEnvCfg()
+        cfg.scene.num_envs, cfg.seed, cfg.sim.device = args.num_envs, 1, args.device
+        cfg.scene.terrain.terrain_generator.seed = 1
+        cfg.scene.terrain.training_stage = args.stage
+        cfg.scene.terrain.physics_substeps = args.substeps
+        env = RslRlVecEnvWrapper(gym.make("Isaac-Velocity-Rough-Go2-DreamWaQ-Mixed-v0", cfg=cfg))
+        raw, terrain = env.unwrapped, env.unwrapped.scene.terrain
+        hard = args.stage == "hard"
+        soil = getattr(raw.action_manager.get_term("joint_pos"), "soil", None)
+        assert (soil is None) == hard
+        assert (terrain.num_rough, terrain.num_soft) == ((args.num_envs, 0) if hard else (0, args.num_envs))
+        assert cfg.decimation == (4 if hard else args.substeps)
+        assert abs(raw.step_dt - 0.02) < 1e-12
+        assert abs(cfg.scene.contact_forces.history_length * cfg.sim.dt - 0.015) < 1e-12
+        assert cfg.terminations.stage_boundary.time_out
+        # Both complete maps and all five scenario columns are still present.
+        assert {"terrain", "soil_bottom", "soil_rim"} <= set(terrain.meshes)
+        assert terrain.soft_scenario_names == ["flat", "mound", "basin", "undulating", "mixed"]
+        assert not soft.outside_training_region(raw).any()
+        origins = terrain.env_origins.clone()
+        obs = env.get_observations()
+        for _ in range(args.steps):
+            with torch.inference_mode():
+                obs, reward, done, extras = env.step(torch.zeros((args.num_envs, 12), device=env.device))
+            for key, width in (("policy", 45), ("prop_history", 225), ("height_scan", 187), ("privileged_vel", 3)):
+                assert obs[key].shape == (args.num_envs, width) and torch.isfinite(obs[key]).all()
+            assert torch.isfinite(reward).all()
+            assert not soft.outside_training_region(raw).any()
+            for value in extras["log"].values():
+                if isinstance(value, torch.Tensor):
+                    assert torch.isfinite(value).all()
+        if soil is not None:
+            assert soil.steps == args.steps * cfg.decimation
+        # Force one robot across each outer/domain boundary. Real autoreset must
+        # use timeout semantics and return it to the requested spawn domain.
+        native = raw.termination_manager.compute
+        captured = {}
+        def record_boundary():
+            result = native()
+            captured["boundary"] = raw.termination_manager.get_term("stage_boundary").clone()
+            captured["timeout"] = raw.termination_manager.time_outs.clone()
+            return result
+        raw.termination_manager.compute = record_boundary
+        for axis, sign in ((0, -1), (0, 1), (1, -1), (1, 1)):
+            state = raw.scene["robot"].data.root_state_w[:1].clone()
+            generator = cfg.scene.terrain.terrain_generator
+            bound = (generator.num_rows * generator.size[0] / 2 * sign if axis == 0 else
+                     generator.num_cols * generator.size[1] / 2 * sign if hard else
+                     float(terrain.soft_bounds[0 if sign < 0 else 1, 1]))
+            state[0, axis] = bound + sign * 0.2
+            state[0, 2] = 1.0
+            state[:, 7:] = 0
+            with torch.inference_mode():
+                raw.scene["robot"].write_root_state_to_sim(state, env_ids=torch.tensor([0], device=env.device))
+                obs, _, done, _ = env.step(torch.zeros((args.num_envs, 12), device=env.device))
+            assert done[0] and captured["boundary"][0] and captured["timeout"][0]
+            assert not soft.outside_training_region(raw).any()
+        raw.termination_manager.compute = native
+        if not hard:
+            torch.testing.assert_close(terrain.env_origins, origins)
+        agent = soft.Go2MixedRunnerCfg().to_dict()
+        original_agent = soft.Go2DreamWaQRoughPPORunnerCfg().to_dict()
+        for key in ("policy", "algorithm", "num_steps_per_env"):
+            assert agent[key] == original_agent[key]
+        runner = soft.make_runner(env, agent, log_dir=None, device=env.device)
+        if args.checkpoint:
+            source = torch.load(args.checkpoint, map_location=env.device, weights_only=False)
+            runner.load(args.checkpoint)
+            assert runner.current_learning_iteration == source["iter"]
+            assert runner.alg.optimizer.state
+            for key, value in runner.alg.policy.state_dict().items():
+                torch.testing.assert_close(value, source["model_state_dict"][key], rtol=0, atol=0)
+            loaded = runner.alg.optimizer.state_dict()
+            assert loaded["param_groups"] == source["optimizer_state_dict"]["param_groups"]
+            for key, values in loaded["state"].items():
+                for name, value in values.items():
+                    expected = source["optimizer_state_dict"]["state"][key][name]
+                    if isinstance(value, torch.Tensor):
+                        torch.testing.assert_close(value, expected.to(value.device), rtol=0, atol=0)
+                    else:
+                        assert value == expected
+        with torch.inference_mode():
+            obs = env.get_observations()
+            for _ in range(runner.num_steps_per_env):
+                obs, rewards, dones, extras = env.step(runner.alg.act(obs))
+                runner.alg.process_env_step(obs, rewards, dones, extras)
+            runner.alg.compute_returns(obs)
+        losses = runner.alg.update()
+        assert all(torch.isfinite(torch.as_tensor(value)) for value in losses.values())
+        print(f"[STAGE CHECK PASS] stage={args.stage} dt={cfg.sim.dt} substeps={cfg.decimation}; "
+              "full map retained; four boundary resets, checkpoint/optimizer and discarded PPO update verified", flush=True)
+        diagnostic_status(True)
+    except Exception:
+        diagnostic_status(False)
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        if env is not None:
+            env.close()
+        app.close()
+
+
 def mixed_check(arguments):
     """Mixed geometry/force/reset and disposable PPO-update acceptance; no saved policy."""
     import argparse
@@ -340,7 +467,7 @@ def mixed_check(arguments):
     parser.add_argument("--soft_fraction", type=float, default=0.5)
     parser.add_argument("--soft_columns", type=int, default=5)
     parser.add_argument("--play_scene", action="store_true", help="Check the same reduced terrain/config used by mixed-play")
-    parser.add_argument("--substeps", type=int, choices=(32, 64), default=32)
+    parser.add_argument("--substeps", type=int, choices=(4, 32, 64), default=32)
     parser.add_argument("--checkpoint", help="Optional weights to verify exact warm start")
     parser.add_argument("--no_adapter", action="store_true", help="Diagnostic rigid-group reference only")
     parser.add_argument("--reference", action="store_true", help="Use the original adapter for an exact paired comparison")
@@ -1921,7 +2048,7 @@ def main():
     if mode == "physics" and ("--sweep_dt" in arguments or "--report_sweep" in arguments):
         physics(arguments)
         return
-    if mode in ("check", "mixed-check", "mixed-profile", "physics", "rollout") and (mode != "rollout" or "--single" in arguments) and "DREAMWAQ_DIAGNOSTIC_STATUS" not in os.environ:
+    if mode in ("check", "mixed-check", "mixed-stage-check", "mixed-profile", "physics", "rollout") and (mode != "rollout" or "--single" in arguments) and "DREAMWAQ_DIAGNOSTIC_STATUS" not in os.environ:
         import subprocess
         import tempfile
         with tempfile.TemporaryDirectory(prefix="dreamwaq_check_") as directory:
@@ -1935,7 +2062,17 @@ def main():
     overview = mode == "mixed-play" and "--overview" in arguments
     if overview:
         arguments.remove("--overview")
-    register_tasks(overview=overview)
+    stage = None
+    if mode in ("mixed-train", "mixed-play"):
+        import argparse
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--stage", choices=("mixed", "hard", "soft"))
+        selection, arguments = parser.parse_known_args(arguments)
+        stage = selection.stage
+    register_tasks(overview=overview, stage=stage)
+    if mode == "mixed-stage-check":
+        stage_check(arguments)
+        return
     if mode == "mixed-profile":
         mixed_profile(arguments)
         return

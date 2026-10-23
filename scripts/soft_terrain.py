@@ -23,7 +23,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.envs.mdp.actions import JointPositionAction
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.sensors import ContactSensor
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
 from isaaclab.terrains import TerrainImporter, TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply
@@ -263,6 +263,8 @@ class MixedSoilTerrainImporter(TerrainImporter):
             raise ValueError("Mixed terrain requires the original generator and enabled soil")
         if not 0 < cfg.soft_fraction < 1 or not math.isfinite(cfg.depth) or cfg.depth <= 0:
             raise ValueError("Mixed soil requires 0 < soft_fraction < 1 and positive depth")
+        if cfg.training_stage not in ("mixed", "hard", "soft"):
+            raise ValueError("training_stage must be mixed, hard or soft")
         if type(cfg.soft_columns) is not int or cfg.soft_columns < 1:
             raise ValueError("soft_columns must be a positive integer")
         if not math.isfinite(cfg.soft_border) or not 0 < cfg.soft_border < min(cfg.terrain_generator.size) / 2:
@@ -278,9 +280,10 @@ class MixedSoilTerrainImporter(TerrainImporter):
         if not all(math.isfinite(value) and value > 0 for value in
                    (cfg.soft_mound_height, cfg.soft_basin_depth, cfg.soft_wave_height, cfg.soft_wave_length)):
             raise ValueError("Soil geometry amplitudes and wavelength must be finite and positive")
-        self.num_soft = round(cfg.num_envs * cfg.soft_fraction)
+        self.num_soft = (0 if cfg.training_stage == "hard" else cfg.num_envs if cfg.training_stage == "soft"
+                         else round(cfg.num_envs * cfg.soft_fraction))
         self.num_rough = cfg.num_envs - self.num_soft
-        if min(self.num_soft, self.num_rough) < 1:
+        if cfg.training_stage == "mixed" and min(self.num_soft, self.num_rough) < 1:
             raise ValueError("Mixed terrain needs at least one environment in each group")
         # IsaacLab 2.0 terrain functions also use global NumPy/Torch RNGs.
         # Retain their inputs so geometry can be regenerated in parity audits.
@@ -295,10 +298,11 @@ class MixedSoilTerrainImporter(TerrainImporter):
         self.soft_mask = torch.arange(cfg.num_envs, device=self.device) >= self.num_rough
         # Distribute the rough group over ALL original terrain columns, rather
         # than retaining only the first half of the original assignments.
-        self.terrain_types[:self.num_rough] = torch.div(
-            torch.arange(self.num_rough, device=self.device),
-            self.num_rough / self.terrain_origins.shape[1], rounding_mode="floor",
-        ).long()
+        if self.num_rough:
+            self.terrain_types[:self.num_rough] = torch.div(
+                torch.arange(self.num_rough, device=self.device),
+                self.num_rough / self.terrain_origins.shape[1], rounding_mode="floor",
+            ).long()
         self.env_origins[:self.num_rough] = self.terrain_origins[
             self.terrain_levels[:self.num_rough], self.terrain_types[:self.num_rough]
         ]
@@ -411,7 +415,8 @@ class MixedSoilTerrainImporter(TerrainImporter):
         cfg.resolved_soft_tiles = len(tops)
         cfg.resolved_soft_scenarios = self.soft_scenario_names
         cfg.soft_surface_sha256 = hashlib.sha256(height_grid.tobytes() + material_grid.tobytes()).hexdigest()
-        print(f"[Mixed soil] rough={self.num_rough}, soft={self.num_soft}; "
+        cfg.adapter_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        print(f"[Mixed soil] stage={cfg.training_stage}; rough={self.num_rough}, soft={self.num_soft}; "
               f"sand tiles={generator.num_rows}x{cfg.soft_columns}, size={sx}x{sy} m; "
               f"flat frame={cfg.soft_border} m per side; "
               f"scenarios={','.join(self.soft_scenario_names)}; "
@@ -443,6 +448,8 @@ class MixedSoilTerrainImporter(TerrainImporter):
 class MixedSoilTerrainCfg(SoilTerrainCfg):
     class_type: type = MixedSoilTerrainImporter
     physics_substeps: int = 32
+    training_stage: str = "mixed"
+    stage_boundary_margin: float = 0.6
     soft_fraction: float = 0.5
     soft_columns: int = 5
     soft_border: float = 1.0
@@ -471,7 +478,23 @@ def mixed_terrain_levels(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
     ids = ids[~terrain.soft_mask[ids]]
     if len(ids):
         terrain_levels_vel(env, ids, asset_cfg=asset_cfg)
-    return terrain.terrain_levels[~terrain.soft_mask].float().mean()
+    return (terrain.terrain_levels[~terrain.soft_mask].float().mean()
+            if terrain.num_rough else torch.zeros((), device=env.device))
+
+
+def outside_training_region(env):
+    """Truncate before feet reach another domain; count this as a timeout, not a fall."""
+    terrain = env.scene.terrain
+    cfg = terrain.cfg
+    sx, sy = cfg.terrain_generator.size
+    lower = terrain.soft_bounds[0].clone()
+    upper = terrain.soft_bounds[1].clone()
+    if cfg.training_stage == "hard":
+        lower[1] = -cfg.terrain_generator.num_cols * sy / 2
+        upper[1] = cfg.terrain_generator.num_cols * sy / 2
+    xy = env.scene["robot"].data.body_pos_w[..., :2]
+    margin = cfg.stage_boundary_margin
+    return ((xy < lower + margin) | (xy > upper - margin)).any(dim=-1).any(dim=-1)
 
 
 class MixedSoilEnv(ManagerBasedRLEnv):
@@ -480,10 +503,14 @@ class MixedSoilEnv(ManagerBasedRLEnv):
         extras["log"] = dict(extras["log"])
         soft = self.scene.terrain.soft_mask
         for name, mask in (("rough", ~soft), ("soft", soft)):
+            if (name == "rough" and self.scene.terrain.num_rough == 0) or (name == "soft" and self.scene.terrain.num_soft == 0):
+                continue
             extras["log"][f"Mixed/{name}_reward_per_second"] = reward[mask].mean() / self.step_dt
             extras["log"][f"Mixed/{name}_termination_fraction"] = terminated[mask].float().mean()
             extras["log"][f"Mixed/{name}_timeout_fraction"] = timeout[mask].float().mean()
         extras["log"]["Mixed/soft_sample_fraction"] = soft.float().mean()
+        if "stage_boundary" in self.termination_manager.active_terms:
+            extras["log"]["Stage/boundary_fraction"] = self.termination_manager.get_term("stage_boundary").float().mean()
         for name, mask in self.scene.terrain.scenario_masks.items():
             extras["log"][f"SoilScenario/{name}_reward_per_second"] = reward[mask].mean() / self.step_dt
             extras["log"][f"SoilScenario/{name}_termination_fraction"] = terminated[mask].float().mean()
@@ -773,10 +800,10 @@ def configure_flat(cfg):
 
 
 def configure_soil_timing(cfg, substeps=64):
-    # 64 is the converged reference; 32 is the mixed-task speed experiment.
-    # Both retain the original 20 ms policy period and 15 ms contact window.
-    if type(substeps) is not int or substeps not in (32, 64):
-        raise ValueError("Soil physics_substeps must be 32 or 64")
+    # 64 is the converged reference; 32 and 4 are explicit speed experiments.
+    # All retain the original 20 ms policy period and 15 ms contact window.
+    if type(substeps) is not int or substeps not in (4, 32, 64):
+        raise ValueError("Soil physics_substeps must be 4, 32 or 64")
     cfg.sim.dt = 0.02 / substeps
     cfg.decimation = cfg.sim.render_interval = substeps
     cfg.scene.contact_forces.update_period = cfg.sim.dt
@@ -798,6 +825,24 @@ def enable_soil(cfg):
     """Resolve after Hydra overrides, before constructing the environment."""
     if cfg.scene.terrain.soft_enabled:
         mixed = isinstance(cfg.scene.terrain, MixedSoilTerrainCfg)
+        if mixed:
+            stage = cfg.scene.terrain.training_stage
+            if stage not in ("mixed", "hard", "soft"):
+                raise ValueError("training_stage must be mixed, hard or soft")
+            if not 0 < cfg.scene.terrain.stage_boundary_margin < min(cfg.scene.terrain.terrain_generator.size) / 4:
+                raise ValueError("stage_boundary_margin must be positive and smaller than a quarter tile")
+            if stage != "mixed":
+                cfg.terminations.stage_boundary = TerminationTermCfg(func=outside_training_region, time_out=True)
+            if stage == "hard":
+                cfg.sim.dt = 0.005
+                cfg.decimation = cfg.sim.render_interval = 4
+                cfg.scene.contact_forces.update_period = cfg.sim.dt
+                cfg.scene.contact_forces.history_length = 3
+                cfg.scene.height_scanner.update_period = 0.02
+                cfg.actions.joint_pos.class_type = JointPositionAction
+                cfg.scene.contact_forces.class_type = ContactSensor
+                cfg.scene.height_scanner.mesh_prim_paths = ["/World/mixed_height_scan"]
+                return
         if mixed:
             # Resolve the single timing selector after Hydra overrides, so dt,
             # decimation, rendering and contact sampling cannot drift apart.
@@ -892,7 +937,9 @@ def make_runner(env, train_cfg, log_dir=None, device="cpu"):
     return runner
 
 
-def make_env(cfg, overview=False, **kwargs):
+def make_env(cfg, overview=False, stage=None, **kwargs):
+    if stage is not None:
+        cfg.scene.terrain.training_stage = stage
     enable_soil(cfg)
     if overview and isinstance(cfg.scene.terrain, MixedSoilTerrainCfg):
         terrain = cfg.scene.terrain

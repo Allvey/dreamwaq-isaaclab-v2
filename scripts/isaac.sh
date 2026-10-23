@@ -26,7 +26,7 @@ case "$command_name" in
     soft-train|soft-play|soft-eval|soft-check|soft-physics|soft-rollout)
         exec python "$project_dir/scripts/run_soft.py" "${command_name#soft-}" "$@"
         ;;
-    mixed-train|mixed-play|mixed-check|mixed-profile)
+    mixed-train|mixed-play|mixed-check|mixed-stage-check|mixed-profile)
         exec python "$project_dir/scripts/run_soft.py" "$command_name" "$@"
         ;;
     train)
@@ -39,7 +39,7 @@ case "$command_name" in
         exec python "$project_dir/scripts/rollout_eval.py" --task Isaac-Velocity-Rough-Go2-DreamWaQ-Play-v0 "$@"
         ;;
     *)
-        echo "Usage: bash scripts/isaac.sh {train|play|eval|soft-train|soft-play|soft-eval|soft-check|soft-physics|soft-rollout|mixed-train|mixed-play|mixed-check|mixed-profile} [arguments]"
+        echo "Usage: bash scripts/isaac.sh {train|play|eval|soft-train|soft-play|soft-eval|soft-check|soft-physics|soft-rollout|mixed-train|mixed-play|mixed-check|mixed-stage-check|mixed-profile} [arguments]"
         if [[ "$command_name" != help && "$command_name" != --help && "$command_name" != -h ]]; then exit 2; fi
         ;;
 esac

@@ -282,6 +282,69 @@ new run directory and treats `--max_iterations` as additional iterations after
 the loaded counter. Existing training processes retain their original timestep;
 they are never automatically stopped or restarted.
 
+### Separate hard/soft stages on the same complete map
+
+`mixed-train --stage hard` and `mixed-train --stage soft` retain the ENTIRE map,
+including all original rough cells and all five soil types. They change robot
+sampling and physics timing, not map geometry. The default `--stage mixed` keeps
+the existing simultaneous training mode.
+
+| Stage | Robot spawn region | Physics per 20 ms control step | Soil proxy |
+| --- | --- | --- | --- |
+| `hard` | Original rough cells only | 4 steps at 5 ms | Disabled; native actions/contact sensor |
+| `soft` | Five soil columns, including their hard lanes | 32 steps at 0.625 ms (or selected 64) | Enabled |
+
+Hard-stage contact history retains the original three samples (15 ms); soft-stage
+history retains 24/48 samples (15 ms). Network inputs, PPO, rewards and PD settings
+are unchanged. Hard-stage rough curriculum remains active. Soft-stage origins
+stay fixed, and no soil difficulty progression is added. `soft_fraction` applies
+only to the simultaneous `mixed` stage; pure stages use 100% of their domain.
+
+A boundary timeout resets a robot as its body links approach within 0.6 m of the
+stage region boundary. It is a truncation with the existing RSL-RL timeout
+bootstrap, not a fall/success reward. Reset and rough curriculum remain confined
+to the selected domain. `Stage/boundary_fraction` reports these events separately.
+The complete mesh remains loaded, so speed gains must be measured, particularly
+for the soft stage. There is no automatic stage scheduler or in-process timestep
+switch: finish/checkpoint one manual run, then manually start the next one.
+
+For example, warm-start a new soft-stage run from the original rough weights:
+
+```bash
+bash scripts/isaac.sh mixed-train --stage soft --headless --num_envs 2048 \
+  --max_iterations 100 --seed 1 --run_name stage_soft_seed1 \
+  env.scene.terrain.physics_substeps=32 \
+  agent.init_checkpoint=logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1/model_1999.pt
+```
+
+To continue into the hard stage, preserving model, optimizer and iteration state:
+
+```bash
+bash scripts/isaac.sh mixed-train --stage hard --headless --num_envs 2048 \
+  --max_iterations 100 --seed 1 --run_name stage_hard_seed1 \
+  --resume True --load_run <previous-soft-run-folder> --checkpoint <model_N.pt>
+```
+
+Then use `--stage soft` and the hard run's checkpoint for the next soft stage.
+With resume, `max_iterations` is the number of ADDITIONAL iterations. Do not add
+`agent.init_checkpoint` when resuming. Every command creates a new timestamped
+run under `logs/rsl_rl/isaaclab/go2_dreamwaq_mixed/`, keeping previous results.
+The 100-iteration blocks are an example, not a validated optimal stage schedule.
+
+Stage choice also works with play; its CLI is `--stage hard` or `--stage soft`.
+Hydra training can instead set `env.scene.terrain.training_stage=hard/soft`.
+Use one stage selector consistently. Resolved `params/env.yaml` records the stage,
+actual dt/decimation, boundary margin and realized group counts.
+
+```bash
+# Diagnostic acceptance only; no runner.learn or model save.
+bash scripts/isaac.sh mixed-stage-check --headless --stage hard --checkpoint /absolute/path/model.pt
+bash scripts/isaac.sh mixed-stage-check --headless --stage soft --substeps 32 --checkpoint /absolute/path/model.pt
+# Matched inference sampling benchmarks; run sequentially on an idle GPU.
+bash scripts/isaac.sh mixed-profile --headless --stage hard --num_envs 2048 --checkpoint /absolute/path/model.pt
+bash scripts/isaac.sh mixed-profile --headless --stage soft --substeps 32 --num_envs 2048 --checkpoint /absolute/path/model.pt
+```
+
 ### Sampling performance
 
 Soil state preparation reuses the existing body-state buffer and the original
