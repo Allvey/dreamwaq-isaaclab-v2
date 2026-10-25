@@ -23,7 +23,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.envs.mdp.actions import JointPositionAction
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.sensors import ContactSensor
-from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
+from isaaclab.managers import SceneEntityCfg, TerminationTermCfg, CurriculumTermCfg
 from isaaclab.terrains import TerrainImporter, TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply
@@ -70,7 +70,7 @@ def sample_soil_points(points: wp.array(dtype=wp.vec3), heights: wp.array2d(dtyp
     h, n, active = soil_surface_sample(points[i], heights, material, lower, spacing)
     height_out[i] = h
     normal_out[i] = n
-    active_out[i] = active
+    active_out[i] = int(active != 0)
 
 
 @wp.func
@@ -129,7 +129,8 @@ def surface_proxy_code(code):
     frame = """    foot_x, foot_y = pf[0], pf[1]
     height, normal, active = soil_surface_sample(pf + origins[w], heights, material, lower, spacing)
     normals[w * 5 + leg] = normal
-    enabled[w * 5 + leg] = active
+    enabled[w * 5 + leg] = int(active != 0)
+    typ = wp.max(active - 1, 0)
     anchor = wp.vec3(pf[0], pf[1], height - origins[w][2])
     rotation = soil_normal_rotation(normal)
     pf = wp.quat_rotate(rotation, pf - anchor)
@@ -147,7 +148,7 @@ def surface_proxy_code(code):
         pb = wp.transform_get_translation(body_q[base])
         height_b, normal_b, active_b = soil_surface_sample(pb + origins[w], heights, material, lower, spacing)
         normals[w * 5 + 4] = normal_b
-        enabled[w * 5 + 4] = active_b
+        enabled[w * 5 + 4] = int(active_b != 0)
         if active_b != 0:
             rb = soil_normal_rotation(normal_b)
             anchor_b = wp.vec3(pb[0], pb[1], height_b - origins[w][2])
@@ -205,8 +206,52 @@ class SoilTerrainCfg(TerrainImporterCfg):
     surface_model: str = "flat nominal top; per-foot plastic memory; 16 footprint holes per environment"
 
 
-def soil_cell_grid(cfg, scenario):
-    """Fixed profiles; all rows repeat the same geometry without a soil curriculum."""
+def soil_level_parameters(cfg, row, num_rows):
+    """Logical curriculum level; independent of the number of physical tiles."""
+    difficulty = row / max(num_rows - 1, 1) if cfg.soft_curriculum else 1.0
+    geometry = cfg.soft_min_geometry_scale + (1.0 - cfg.soft_min_geometry_scale) * difficulty
+    bearing = cfg.soft_easy_bearing_scale ** (1.0 - difficulty)
+    # Keep material transitions on grid edges, including both stripe boundaries.
+    width = cfg.soft_easy_stripe_width + (cfg.soft_stripe_width - cfg.soft_easy_stripe_width) * difficulty
+    width = max(2 * cfg.soft_resolution, round(width / (2 * cfg.soft_resolution)) * 2 * cfg.soft_resolution)
+    return geometry, bearing, width
+
+
+def soil_curriculum_spec(cfg):
+    keys = ("soft_columns", "soft_scenarios", "soft_border", "soft_resolution", "soft_mound_height",
+            "soft_basin_depth", "soft_wave_height", "soft_wave_length", "soft_stripe_width",
+            "soft_min_geometry_scale", "soft_easy_bearing_scale", "soft_easy_stripe_width",
+            "depth", "material", "bearing_scale", "drag_scale", "footprint_keep",
+            "floor_stiffness", "normal_damping", "drag_damping_cap")
+    return {**{key: getattr(cfg, key) for key in keys},
+            "rows": cfg.soft_num_levels if cfg.soft_spatial_curriculum else 1, "levels": cfg.soft_num_levels,
+            "layout": "spatial_soil_curriculum_v1" if cfg.soft_spatial_curriculum else "five_tiles_fixed_level_v1",
+            "tile_size": list(cfg.terrain_generator.size)}
+
+
+def soil_stage_state(state, cfg):
+    """Migrate the former spatial-row metadata without changing model weights."""
+    from copy import deepcopy
+    if state is None:
+        return None
+    state = deepcopy(state)
+    topology = state["topology"]
+    expected = soil_curriculum_spec(cfg)
+    if "layout" not in topology:
+        topology = dict(topology, rows=1, levels=topology["rows"], layout=expected["layout"])
+    if topology != expected:
+        raise ValueError("Saved soil geometry/material/level definitions differ from the current environment")
+    state["topology"] = expected
+    state.pop("levels_by_column", None)
+    level = state.get("soft_level_ceiling", 0)
+    if type(level) is not int or not 0 <= level < cfg.soft_num_levels:
+        raise ValueError("Invalid saved logical soil level")
+    state["soft_level_ceiling"] = level
+    return state
+
+
+def soil_cell_grid(cfg, scenario, row=None):
+    """Same lattice for rendering, collision, height scans and graded soil forces."""
     import numpy as np
     sx, sy = cfg.terrain_generator.size
     nx, ny = round(sx / cfg.soft_resolution), round(sy / cfg.soft_resolution)
@@ -217,17 +262,19 @@ def soil_cell_grid(cfg, scenario):
     inside_vertices = (np.abs(xx) < ax) & (np.abs(yy) < ay)
     window *= inside_vertices
     z = np.zeros_like(xx)
+    geometry, _, stripe_width = (soil_level_parameters(cfg, row, cfg.soft_num_levels)
+                                if row is not None else (1.0, 1.0, cfg.soft_stripe_width))
     if scenario == "mound":
-        z = cfg.soft_mound_height * window
+        z = geometry * cfg.soft_mound_height * window
     elif scenario == "basin":
-        z = -cfg.soft_basin_depth * window
+        z = -geometry * cfg.soft_basin_depth * window
     elif scenario == "undulating":
-        z = cfg.soft_wave_height * window * np.cos(2 * np.pi * xx / cfg.soft_wave_length) * np.cos(2 * np.pi * yy / cfg.soft_wave_length)
+        z = geometry * cfg.soft_wave_height * window * np.cos(2 * np.pi * xx / cfg.soft_wave_length) * np.cos(2 * np.pi * yy / cfg.soft_wave_length)
     xc, yc = np.meshgrid((x[:-1] + x[1:]) / 2, (y[:-1] + y[1:]) / 2, indexing="ij")
     inner = (np.abs(xc) < ax) & (np.abs(yc) < ay)
     active = inner.copy()
     if scenario == "mixed":
-        active &= np.floor((xc + cfg.soft_stripe_width / 2) / cfg.soft_stripe_width).astype(int) % 2 == 0
+        active &= np.floor((xc + stripe_width / 2) / stripe_width).astype(int) % 2 == 0
     return xx, yy, z, active, inner
 
 
@@ -265,8 +312,8 @@ class MixedSoilTerrainImporter(TerrainImporter):
             raise ValueError("Mixed soil requires 0 < soft_fraction < 1 and positive depth")
         if cfg.training_stage not in ("mixed", "hard", "soft"):
             raise ValueError("training_stage must be mixed, hard or soft")
-        if type(cfg.soft_columns) is not int or cfg.soft_columns < 1:
-            raise ValueError("soft_columns must be a positive integer")
+        if type(cfg.soft_columns) is not int or not 1 <= cfg.soft_columns <= 5:
+            raise ValueError("Use between one and five physical soil tiles")
         if not math.isfinite(cfg.soft_border) or not 0 < cfg.soft_border < min(cfg.terrain_generator.size) / 2:
             raise ValueError("soft_border must be positive and less than half a tile's size")
         valid_scenarios = {"flat", "mound", "basin", "undulating", "mixed"}
@@ -280,6 +327,21 @@ class MixedSoilTerrainImporter(TerrainImporter):
         if not all(math.isfinite(value) and value > 0 for value in
                    (cfg.soft_mound_height, cfg.soft_basin_depth, cfg.soft_wave_height, cfg.soft_wave_length)):
             raise ValueError("Soil geometry amplitudes and wavelength must be finite and positive")
+        if not (0 < cfg.soft_min_geometry_scale <= 1 and math.isfinite(cfg.soft_easy_bearing_scale)
+                and cfg.soft_easy_bearing_scale >= 1 and cfg.soft_easy_stripe_width >= cfg.soft_stripe_width
+                and math.isfinite(cfg.soft_easy_stripe_width)
+                and type(cfg.soft_max_init_level) is int and cfg.soft_max_init_level >= 0
+                and type(cfg.soft_num_levels) is int and cfg.soft_num_levels >= 2
+                and type(cfg.soft_level_ceiling) is int and 0 <= cfg.soft_level_ceiling < cfg.soft_num_levels
+                and 0 <= cfg.soft_min_contact_fraction <= 1):
+            raise ValueError("Invalid soft curriculum geometry, bearing, stripe, initial level or contact fraction")
+        if abs(cfg.soft_easy_stripe_width / (2 * cfg.soft_resolution)
+               - round(cfg.soft_easy_stripe_width / (2 * cfg.soft_resolution))) > 1e-6:
+            raise ValueError("Easy half stripe width must align with soft_resolution")
+        self.soft_level = cfg.soft_level_ceiling if cfg.soft_curriculum else cfg.soft_num_levels - 1
+        rows = cfg.soft_num_levels if cfg.soft_spatial_curriculum else 1
+        if cfg.soft_spatial_curriculum and not (cfg.isolated_training and cfg.training_stage == "soft"):
+            raise ValueError("Spatial soil curriculum uses an isolated soft-only scene")
         self.num_soft = (0 if cfg.training_stage == "hard" else cfg.num_envs if cfg.training_stage == "soft"
                          else round(cfg.num_envs * cfg.soft_fraction))
         self.num_rough = cfg.num_envs - self.num_soft
@@ -290,11 +352,28 @@ class MixedSoilTerrainImporter(TerrainImporter):
         self._rough_numpy_state = np.random.get_state()
         self._rough_torch_state = torch.get_rng_state()
         self._rough_cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
-        super().__init__(cfg)
-        rough = self.meshes["terrain"]
-        cfg.rough_mesh_sha256 = hashlib.sha256(
-            rough.vertices.tobytes() + rough.faces.tobytes()
-        ).hexdigest()
+        isolated = cfg.isolated_training
+        if isolated:
+            if cfg.training_stage != "soft":
+                raise ValueError("Isolated hard training must use the native TerrainImporter")
+            # Initialize the importer without generating/importing any rough
+            # terrain. Only the soil bottom, frames and outer border collide.
+            cfg.validate()
+            self.cfg = cfg
+            self.device = sim_utils.SimulationContext.instance().device
+            self.meshes, self.warp_meshes, self._terrain_flat_patches = {}, {}, {}
+            self.env_origins = torch.zeros((cfg.num_envs, 3), device=self.device)
+            self.terrain_origins = None
+            self.terrain_levels = torch.zeros(cfg.num_envs, dtype=torch.long, device=self.device)
+            self.terrain_types = torch.arange(cfg.num_envs, device=self.device) % cfg.soft_columns
+            self.max_terrain_level = rows
+            rough = None
+        else:
+            super().__init__(cfg)
+            rough = self.meshes["terrain"]
+            cfg.rough_mesh_sha256 = hashlib.sha256(
+                rough.vertices.tobytes() + rough.faces.tobytes()
+            ).hexdigest()
         self.soft_mask = torch.arange(cfg.num_envs, device=self.device) >= self.num_rough
         # Distribute the rough group over ALL original terrain columns, rather
         # than retaining only the first half of the original assignments.
@@ -303,24 +382,30 @@ class MixedSoilTerrainImporter(TerrainImporter):
                 torch.arange(self.num_rough, device=self.device),
                 self.num_rough / self.terrain_origins.shape[1], rounding_mode="floor",
             ).long()
-        self.env_origins[:self.num_rough] = self.terrain_origins[
-            self.terrain_levels[:self.num_rough], self.terrain_types[:self.num_rough]
-        ]
+            self.env_origins[:self.num_rough] = self.terrain_origins[
+                self.terrain_levels[:self.num_rough], self.terrain_types[:self.num_rough]
+            ]
         # Append directly to the next original grid column, with an inset sand
         # patch and a flat rigid frame inside EACH same-sized terrain cell.
         generator = cfg.terrain_generator
         sx, sy = generator.size
-        lo = np.array([-generator.num_rows * sx / 2, generator.num_cols * sy / 2])
-        hi = lo + np.array([generator.num_rows * sx, cfg.soft_columns * sy])
+        lo = np.array([-rows * sx / 2,
+                       -cfg.soft_columns * sy / 2 if isolated else generator.num_cols * sy / 2])
+        hi = lo + np.array([rows * sx, cfg.soft_columns * sy])
         tops, centres, rim = [], [], []
         nx, ny = round(sx / cfg.soft_resolution), round(sy / cfg.soft_resolution)
-        height_grid = np.zeros((generator.num_rows * nx + 1, cfg.soft_columns * ny + 1), dtype=np.float32)
-        material_grid = np.zeros((generator.num_rows * nx, cfg.soft_columns * ny), dtype=np.int32)
+        height_grid = np.zeros((rows * nx + 1, cfg.soft_columns * ny + 1), dtype=np.float32)
+        material_grid = np.zeros((rows * nx, cfg.soft_columns * ny), dtype=np.int32)
         i, j = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
         a = (i * (ny + 1) + j).flatten()
         faces = np.stack((np.stack((a, a + ny + 1, a + 1), axis=1),
                           np.stack((a + ny + 2, a + 1, a + ny + 1), axis=1)), axis=1).reshape(-1, 3)
         self.soft_scenario_names = [cfg.soft_scenarios[col % len(cfg.soft_scenarios)] for col in range(cfg.soft_columns)]
+        self.soft_curriculum_active = cfg.soft_curriculum and generator.curriculum
+        self.soft_bearing_scales = [soil_level_parameters(
+            cfg, row if cfg.soft_spatial_curriculum else self.soft_level, cfg.soft_num_levels)[1] for row in range(rows)]
+        self.soft_contact_steps = torch.zeros(cfg.num_envs, device=self.device)
+        self.soft_sample_steps = torch.zeros_like(self.soft_contact_steps)
 
         def rectangle(lower, upper):
             lower, upper = np.asarray(lower), np.asarray(upper)
@@ -329,10 +414,11 @@ class MixedSoilTerrainImporter(TerrainImporter):
                 plane.apply_translation([*((lower + upper) / 2), 0.0])
                 rim.append(plane)
 
-        for row in range(generator.num_rows):
+        for row in range(rows):
             for col in range(cfg.soft_columns):
                 centre = [lo[0] + (row + 0.5) * sx, lo[1] + (col + 0.5) * sy, 0.0]
-                xx, yy, zz, active, inner = soil_cell_grid(cfg, self.soft_scenario_names[col])
+                xx, yy, zz, active, inner = soil_cell_grid(
+                    cfg, self.soft_scenario_names[col], row if cfg.soft_spatial_curriculum else self.soft_level)
                 vertices = np.stack((xx + centre[0], yy + centre[1], zz), axis=-1).reshape(-1, 3)
                 tile = trimesh.Trimesh(vertices=vertices, faces=faces[np.repeat(active.flatten(), 2)], process=False)
                 tile.remove_unreferenced_vertices()
@@ -342,7 +428,8 @@ class MixedSoilTerrainImporter(TerrainImporter):
                     hard.remove_unreferenced_vertices()
                     rim.append(hard)
                 height_grid[row * nx:(row + 1) * nx + 1, col * ny:(col + 1) * ny + 1] = zz
-                material_grid[row * nx:(row + 1) * nx, col * ny:(col + 1) * ny] = active
+                # Actual foot location selects the real row's material table.
+                material_grid[row * nx:(row + 1) * nx, col * ny:(col + 1) * ny] = active * (row + 1)
                 tops.append(tile)
                 centre[2] = float(zz[nx // 2, ny // 2])
                 centres.append(centre)
@@ -354,8 +441,14 @@ class MixedSoilTerrainImporter(TerrainImporter):
                 rectangle([inset_lo[0], lower[1]], [inset_hi[0], inset_lo[1]])
                 rectangle([inset_lo[0], inset_hi[1]], [inset_hi[0], upper[1]])
         self.soft_tile_origins = torch.tensor(centres, dtype=torch.float, device=self.device)
+        if isolated:
+            self.terrain_origins = self.soft_tile_origins.view(rows, cfg.soft_columns, 3)
         sample = torch.arange(self.num_soft, device=self.device)
-        self.soft_tile_ids = ((sample // cfg.soft_columns) % generator.num_rows) * cfg.soft_columns + sample % cfg.soft_columns
+        soft_levels = torch.full((self.num_soft,), self.soft_level, dtype=torch.long, device=self.device)
+        if cfg.soft_spatial_curriculum:
+            soft_levels = torch.randint(min(cfg.soft_max_init_level, rows - 1) + 1,
+                                        (self.num_soft,), device=self.device)
+        self.soft_tile_ids = (soft_levels * cfg.soft_columns if cfg.soft_spatial_curriculum else 0) + sample % cfg.soft_columns
         self.scenario_masks = {}
         for scenario in dict.fromkeys(self.soft_scenario_names):
             selected = torch.zeros(self.num_soft, dtype=torch.bool, device=self.device)
@@ -368,7 +461,7 @@ class MixedSoilTerrainImporter(TerrainImporter):
                 self.scenario_masks[scenario] = mask
         soil_origins = self.soft_tile_origins[self.soft_tile_ids]
         self.env_origins[self.soft_mask] = soil_origins
-        self.terrain_levels[self.soft_mask] = 0
+        self.terrain_levels[self.soft_mask] = soft_levels
         self.soft_origins = soil_origins.clone()
         self.soft_bounds = torch.tensor(np.stack((lo, hi)), dtype=torch.float, device=self.device)
         self.surface_heights = wp.array(height_grid, dtype=float, device=self.device)
@@ -381,11 +474,17 @@ class MixedSoilTerrainImporter(TerrainImporter):
 
         # One outer border around the COMPLETE grid, including the new columns.
         margin = generator.border_width
-        grid_lo = np.array([lo[0], -generator.num_cols * sy / 2])
-        rectangle(grid_lo - margin, [grid_lo[0], hi[1] + margin])
-        rectangle([hi[0], grid_lo[1] - margin], hi + margin)
-        rectangle([grid_lo[0], grid_lo[1] - margin], [hi[0], grid_lo[1]])
-        rectangle([grid_lo[0], hi[1]], [hi[0], hi[1] + margin])
+        grid_lo = lo if isolated else np.array([-generator.num_rows * sx / 2, -generator.num_cols * sy / 2])
+        grid_hi = hi if isolated else np.array([generator.num_rows * sx / 2, hi[1]])
+        if not isolated:
+            # Fill the unused ends beside the short soil strip. Keep the rough
+            # perimeter flat without placing a rigid surface underneath soil.
+            rectangle([grid_lo[0], lo[1]], [lo[0], hi[1]])
+            rectangle([hi[0], lo[1]], grid_hi)
+        rectangle(grid_lo - margin, [grid_lo[0], grid_hi[1] + margin])
+        rectangle([grid_hi[0], grid_lo[1] - margin], grid_hi + margin)
+        rectangle([grid_lo[0], grid_lo[1] - margin], [grid_hi[0], grid_lo[1]])
+        rectangle([grid_lo[0], grid_hi[1]], [grid_hi[0], grid_hi[1] + margin])
         rim_mesh = trimesh.util.concatenate(rim)
         self.import_mesh("soil_rim", rim_mesh)
         stage = omni.usd.get_context().get_stage()
@@ -410,16 +509,19 @@ class MixedSoilTerrainImporter(TerrainImporter):
             sensor_mesh(f"/World/soil_surface/tile_{row}_{col}_{self.soft_scenario_names[col]}", tile, color)
         # IsaacLab 2.0 RayCaster accepts one mesh: combine only the nominal
         # surfaces, never the soft bottom. This duplicate has no collision API.
-        sensor_mesh("/World/mixed_height_scan", trimesh.util.concatenate([rough, top, rim_mesh]))
+        sensor_mesh("/World/mixed_height_scan", trimesh.util.concatenate(
+            [top, rim_mesh] if isolated else [rough, top, rim_mesh]))
+        if isolated:
+            self.set_debug_vis(cfg.debug_vis)
         cfg.resolved_num_rough, cfg.resolved_num_soft = self.num_rough, self.num_soft
         cfg.resolved_soft_tiles = len(tops)
         cfg.resolved_soft_scenarios = self.soft_scenario_names
         cfg.soft_surface_sha256 = hashlib.sha256(height_grid.tobytes() + material_grid.tobytes()).hexdigest()
         cfg.adapter_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         print(f"[Mixed soil] stage={cfg.training_stage}; rough={self.num_rough}, soft={self.num_soft}; "
-              f"sand tiles={generator.num_rows}x{cfg.soft_columns}, size={sx}x{sy} m; "
+              f"sand tiles={rows}x{cfg.soft_columns}, size={sx}x{sy} m; "
               f"flat frame={cfg.soft_border} m per side; "
-              f"scenarios={','.join(self.soft_scenario_names)}; "
+              f"scenarios={','.join(self.soft_scenario_names)}; soft curriculum={self.soft_curriculum_active}; "
               f"rough mesh={cfg.rough_mesh_sha256[:12]}", flush=True)
 
     def update_env_origins(self, env_ids, move_up, move_down):
@@ -428,6 +530,23 @@ class MixedSoilTerrainImporter(TerrainImporter):
         rough = ~self.soft_mask[ids]
         if rough.any():
             super().update_env_origins(ids[rough], move_up[rough], move_down[rough])
+        if self.cfg.soft_spatial_curriculum and (~rough).any():
+            self.update_soft_origins(ids[~rough], move_up[~rough], move_down[~rough])
+
+    def update_soft_origins(self, ids, move_up, move_down):
+        soft_ids = ids - self.num_rough
+        if self.cfg.soft_spatial_curriculum:
+            levels = self.terrain_levels[ids] + move_up.long() - move_down.long()
+            # Match TerrainImporter.update_env_origins, using the soil row count.
+            levels = torch.where(levels >= self.cfg.soft_num_levels,
+                                 torch.randint_like(levels, self.cfg.soft_num_levels), levels.clamp(min=0))
+            self.terrain_levels[ids] = levels
+            columns = self.soft_tile_ids[soft_ids] % self.cfg.soft_columns
+            self.soft_tile_ids[soft_ids] = levels * self.cfg.soft_columns + columns
+        else:
+            self.terrain_levels[ids] = self.soft_level
+        self.env_origins[ids] = self.soft_tile_origins[self.soft_tile_ids[soft_ids]]
+        self.soft_origins[soft_ids] = self.env_origins[ids]
 
     def sample_surface(self, points):
         shape = points.shape[:-1]
@@ -447,8 +566,9 @@ class MixedSoilTerrainImporter(TerrainImporter):
 @configclass
 class MixedSoilTerrainCfg(SoilTerrainCfg):
     class_type: type = MixedSoilTerrainImporter
-    physics_substeps: int = 32
+    physics_substeps: int = 64
     training_stage: str = "mixed"
+    isolated_training: bool = False
     stage_boundary_margin: float = 0.6
     soft_fraction: float = 0.5
     soft_columns: int = 5
@@ -460,6 +580,15 @@ class MixedSoilTerrainCfg(SoilTerrainCfg):
     soft_wave_height: float = 0.10
     soft_wave_length: float = 2.0
     soft_stripe_width: float = 1.0
+    soft_curriculum: bool = True
+    soft_max_init_level: int = 0
+    soft_level_ceiling: int = 0
+    soft_num_levels: int = 10
+    soft_spatial_curriculum: bool = False
+    soft_min_geometry_scale: float = 0.1
+    soft_easy_bearing_scale: float = 4.0
+    soft_easy_stripe_width: float = 3.0
+    soft_min_contact_fraction: float = 0.2
     resolved_soft_scenarios: list[str] = []
     soft_surface_sha256: str = ""
     resolved_soft_tiles: int = 0
@@ -467,7 +596,7 @@ class MixedSoilTerrainCfg(SoilTerrainCfg):
     resolved_num_soft: int = 0
     rough_mesh_sha256: str = ""
     source_rough_mesh_sha256: str = ""
-    surface_model: str = "five fixed soil scenarios; triangulated surface and local tangent-plane proxy; shared outer border"
+    surface_model: str = "at most five soil tiles at one fixed logical level; local tangent-plane proxy; flat frames and border"
 
 
 def mixed_terrain_levels(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
@@ -475,11 +604,21 @@ def mixed_terrain_levels(env, env_ids, asset_cfg=SceneEntityCfg("robot")):
     terrain = env.scene.terrain
     ids = (torch.arange(env.num_envs, device=env.device)[env_ids]
            if isinstance(env_ids, slice) else torch.as_tensor(env_ids, device=env.device, dtype=torch.long))
-    ids = ids[~terrain.soft_mask[ids]]
-    if len(ids):
-        terrain_levels_vel(env, ids, asset_cfg=asset_cfg)
-    return (terrain.terrain_levels[~terrain.soft_mask].float().mean()
-            if terrain.num_rough else torch.zeros((), device=env.device))
+    rough_ids, soft_ids = ids[~terrain.soft_mask[ids]], ids[terrain.soft_mask[ids]]
+    if len(rough_ids):
+        terrain_levels_vel(env, rough_ids, asset_cfg=asset_cfg)
+    if len(soft_ids) and terrain.soft_curriculum_active:
+        if terrain.cfg.soft_spatial_curriculum:
+            # Use the exact native distance/current-command rules. Initial or
+            # explicit resets without an elapsed episode must not promote robots.
+            active = soft_ids[env.episode_length_buf[soft_ids] > 0]
+            if len(active):
+                terrain_levels_vel(env, active, asset_cfg=asset_cfg)
+        terrain.soft_contact_steps[soft_ids] = 0
+        terrain.soft_sample_steps[soft_ids] = 0
+    return (terrain.terrain_levels[~terrain.soft_mask].float().mean() if terrain.num_rough
+            else terrain.terrain_levels.float().mean() if terrain.cfg.soft_spatial_curriculum
+            else torch.zeros((), device=env.device))
 
 
 def outside_training_region(env):
@@ -490,6 +629,8 @@ def outside_training_region(env):
     lower = terrain.soft_bounds[0].clone()
     upper = terrain.soft_bounds[1].clone()
     if cfg.training_stage == "hard":
+        lower[0] = -cfg.terrain_generator.num_rows * sx / 2
+        upper[0] = cfg.terrain_generator.num_rows * sx / 2
         lower[1] = -cfg.terrain_generator.num_cols * sy / 2
         upper[1] = cfg.terrain_generator.num_cols * sy / 2
     xy = env.scene["robot"].data.body_pos_w[..., :2]
@@ -515,6 +656,21 @@ class MixedSoilEnv(ManagerBasedRLEnv):
             extras["log"][f"SoilScenario/{name}_reward_per_second"] = reward[mask].mean() / self.step_dt
             extras["log"][f"SoilScenario/{name}_termination_fraction"] = terminated[mask].float().mean()
             extras["log"][f"SoilScenario/{name}_timeout_fraction"] = timeout[mask].float().mean()
+            extras["log"][f"SoilCurriculum/{name}_level"] = self.scene.terrain.terrain_levels[mask].float().mean()
+            if self.scene.terrain.cfg.soft_spatial_curriculum:
+                error = (self.scene["robot"].data.root_lin_vel_b[mask, :2]
+                         - self.command_manager.get_command("base_velocity")[mask, :2])
+                extras["log"][f"SoilScenario/{name}_tracking_rmse_xy"] = error.square().sum(-1).mean().sqrt()
+                soil = self.action_manager.get_term("joint_pos").soil
+                extras["log"][f"SoilScenario/{name}_soft_contact_fraction"] = soil.contact[mask].bool().any(-1).float().mean()
+                for level in range(self.scene.terrain.cfg.soft_num_levels):
+                    extras["log"][f"SoilCurriculum/{name}_level_{level}_fraction"] = (
+                        self.scene.terrain.terrain_levels[mask] == level).float().mean()
+        if self.scene.terrain.num_soft:
+            extras["log"]["SoilCurriculum/mean_level"] = self.scene.terrain.terrain_levels[soft].float().mean()
+            cfg = self.scene.terrain.cfg
+            extras["log"]["SoilCurriculum/level_ceiling"] = float(
+                cfg.soft_num_levels - 1 if cfg.soft_spatial_curriculum else cfg.soft_level_ceiling)
         return obs, reward, terminated, timeout, extras
 
 
@@ -643,7 +799,9 @@ class SoilModel:
         self.surface_enabled = torch.zeros((self.n, 5), dtype=torch.int32, device=self.device)
         self.origins = env.scene.env_origins.contiguous()
         wp.init()
-        self.table = self.proxy.make_table([self.row], device=self.device)
+        rows = [dict(self.row, bear_a=self.row["bear_a"] * scale)
+                for scale in getattr(env.scene.terrain, "soft_bearing_scales", [1.0])]
+        self.table = self.proxy.make_table(rows, device=self.device)
         def a(value, dtype=float):
             return wp.array(value, dtype=dtype, device=self.device)
         self.inputs = [
@@ -682,6 +840,12 @@ class SoilModel:
     def apply(self):
         self.prepare_state()
         self.evaluate()
+        if (self.surface_terrain is not None and self.surface_terrain.soft_curriculum_active
+                and self.env._sim_step_counter % self.env.cfg.decimation == 0):
+            # Once per policy step; retain statistics until the pre-reset
+            # curriculum callback, without extra PhysX reads or GPU/CPU syncs.
+            self.surface_terrain.soft_contact_steps.add_((self.contact > 0).any(dim=1))
+            self.surface_terrain.soft_sample_steps.add_(1)
         self.apply_wrench(position=self.world_com)
         self.steps += 1
 
@@ -800,10 +964,10 @@ def configure_flat(cfg):
 
 
 def configure_soil_timing(cfg, substeps=64):
-    # 64 is the converged reference; 32 and 4 are explicit speed experiments.
+    # 64 is the converged reference; smaller counts are explicit speed experiments.
     # All retain the original 20 ms policy period and 15 ms contact window.
-    if type(substeps) is not int or substeps not in (4, 32, 64):
-        raise ValueError("Soil physics_substeps must be 4, 32 or 64")
+    if type(substeps) is not int or substeps not in (4, 16, 32, 64):
+        raise ValueError("Soil physics_substeps must be 4, 16, 32 or 64")
     cfg.sim.dt = 0.02 / substeps
     cfg.decimation = cfg.sim.render_interval = substeps
     cfg.scene.contact_forces.update_period = cfg.sim.dt
@@ -831,7 +995,8 @@ def enable_soil(cfg):
                 raise ValueError("training_stage must be mixed, hard or soft")
             if not 0 < cfg.scene.terrain.stage_boundary_margin < min(cfg.scene.terrain.terrain_generator.size) / 4:
                 raise ValueError("stage_boundary_margin must be positive and smaller than a quarter tile")
-            if stage != "mixed":
+            if (stage != "mixed" and not (stage == "hard" and cfg.scene.terrain.isolated_training)
+                    and not cfg.scene.terrain.soft_spatial_curriculum):
                 cfg.terminations.stage_boundary = TerminationTermCfg(func=outside_training_region, time_out=True)
             if stage == "hard":
                 cfg.sim.dt = 0.005
@@ -841,7 +1006,16 @@ def enable_soil(cfg):
                 cfg.scene.height_scanner.update_period = 0.02
                 cfg.actions.joint_pos.class_type = JointPositionAction
                 cfg.scene.contact_forces.class_type = ContactSensor
-                cfg.scene.height_scanner.mesh_prim_paths = ["/World/mixed_height_scan"]
+                if cfg.scene.terrain.isolated_training:
+                    from isaaclab_tasks.manager_based.locomotion.velocity.mdp import terrain_levels_vel
+                    cfg.scene.terrain.class_type = TerrainImporter
+                    if cfg.curriculum.terrain_levels is not None:
+                        cfg.curriculum.terrain_levels.func = terrain_levels_vel
+                    if hasattr(cfg.terminations, "stage_boundary"):
+                        cfg.terminations.stage_boundary = None
+                    cfg.scene.height_scanner.mesh_prim_paths = ["/World/ground"]
+                else:
+                    cfg.scene.height_scanner.mesh_prim_paths = ["/World/mixed_height_scan"]
                 return
         if mixed:
             # Resolve the single timing selector after Hydra overrides, so dt,
@@ -899,6 +1073,32 @@ class Go2MixedPlayEnvCfg(Go2DreamWaQRoughEnvCfg_PLAY):
         self.viewer.lookat = (0.0, 0.0, 0.0)
 
 
+def configure_spatial_soil(cfg, play=False):
+    terrain = cfg.scene.terrain
+    terrain.training_stage, terrain.isolated_training = "soft", True
+    terrain.soft_spatial_curriculum, terrain.soft_curriculum = True, True
+    terrain.soft_num_levels, terrain.soft_columns, terrain.soft_max_init_level = 5, 5, 1
+    terrain.terrain_generator.num_rows = terrain.terrain_generator.num_cols = 5
+    terrain.terrain_generator.curriculum = not play
+    terrain.surface_model = "five difficulty rows x five scenario columns; native distance curriculum"
+    cfg.curriculum.terrain_levels = None if play else CurriculumTermCfg(func=mixed_terrain_levels)
+
+
+@configclass
+class Go2SoilCurriculumEnvCfg(Go2MixedEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        configure_spatial_soil(self)
+
+
+@configclass
+class Go2SoilCurriculumPlayEnvCfg(Go2MixedPlayEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        configure_spatial_soil(self, play=True)
+        self.scene.num_envs = 25
+
+
 @configclass
 class Go2SoftRunnerCfg(Go2DreamWaQRoughPPORunnerCfg):
     # Warm start into a new run; distinct from resuming optimizer/iteration state.
@@ -912,9 +1112,18 @@ class Go2SoftRunnerCfg(Go2DreamWaQRoughPPORunnerCfg):
 
 @configclass
 class Go2MixedRunnerCfg(Go2SoftRunnerCfg):
+    stage_report: str = ""
+
     def __post_init__(self):
         super().__post_init__()
         self.experiment_name = "isaaclab/go2_dreamwaq_mixed"
+
+
+@configclass
+class Go2SoilCurriculumRunnerCfg(Go2SoftRunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "isaaclab/go2_dreamwaq_soft_curriculum"
 
 
 def make_runner(env, train_cfg, log_dir=None, device="cpu"):
@@ -928,7 +1137,126 @@ def make_runner(env, train_cfg, log_dir=None, device="cpu"):
         checkpoint = Path(checkpoint).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
-    runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device=device)
+    mixed = isinstance(env.unwrapped.cfg.scene.terrain, MixedSoilTerrainCfg)
+    runner_type = OnPolicyRunner
+    spatial = mixed and env.unwrapped.cfg.scene.terrain.soft_spatial_curriculum
+    if spatial:
+        class SoilCurriculumRunner(OnPolicyRunner):
+            def save(self, path, infos=None):
+                terrain = self.env.unwrapped.scene.terrain
+                metadata = {"topology": soil_curriculum_spec(terrain.cfg),
+                            "physics_dt": self.env.unwrapped.physics_dt,
+                            "levels": terrain.terrain_levels.detach().cpu().tolist()}
+                if not hasattr(self, "logger_type"):
+                    self.logger_type = "tensorboard"
+                return super().save(path, dict(infos or {}, dreamwaq_soil_curriculum=metadata))
+
+            def load(self, path, load_optimizer=True, map_location=None):
+                saved = torch.load(path, map_location="cpu", weights_only=False)
+                metadata = (saved.get("infos") or {}).get("dreamwaq_soil_curriculum")
+                terrain = self.env.unwrapped.scene.terrain
+                if metadata is None and self.cfg.get("resume"):
+                    raise ValueError("Resume needs a checkpoint from the spatial soil curriculum task")
+                if metadata is not None:
+                    if (metadata["topology"] != soil_curriculum_spec(terrain.cfg)
+                            or metadata["physics_dt"] != self.env.unwrapped.physics_dt):
+                        raise ValueError("Saved spatial soil layout/material/timing differs from this environment")
+                    old = torch.tensor(metadata["levels"], dtype=torch.long, device=terrain.device)
+                    if not len(old) or (old < 0).any() or (old >= terrain.cfg.soft_num_levels).any():
+                        raise ValueError("Invalid saved soil curriculum levels")
+                result = super().load(path, load_optimizer=load_optimizer, map_location=map_location)
+                if metadata is not None:
+                    # Same robot count restores exact levels. For visualization
+                    # with fewer robots, cycle the saved levels within each column.
+                    for col in range(terrain.cfg.soft_columns):
+                        ids = torch.arange(col, self.env.num_envs, terrain.cfg.soft_columns, device=terrain.device)
+                        pool = old[col::terrain.cfg.soft_columns]
+                        if len(ids):
+                            terrain.terrain_levels[ids] = (pool[torch.arange(len(ids), device=terrain.device) % len(pool)]
+                                                          if len(pool) else 0)
+                    terrain.soft_tile_ids[:] = (terrain.terrain_levels * terrain.cfg.soft_columns
+                                               + torch.arange(self.env.num_envs, device=terrain.device) % terrain.cfg.soft_columns)
+                    ids = torch.arange(self.env.num_envs, device=terrain.device)
+                    zeros = torch.zeros_like(ids, dtype=torch.bool)
+                    terrain.update_soft_origins(ids, zeros, zeros)
+                    active = terrain.soft_curriculum_active
+                    terrain.soft_curriculum_active = False
+                    try:
+                        with torch.inference_mode():
+                            self.env.reset()
+                    finally:
+                        terrain.soft_curriculum_active = active
+                return result
+
+        runner_type = SoilCurriculumRunner
+    elif mixed:
+        from copy import deepcopy
+        from run_soft import validate_stage_report
+
+        class StageRunner(OnPolicyRunner):
+            """Only checkpoint metadata and stage admission; native PPO/learn are unchanged."""
+            stage_state = None
+
+            def load(self, path, load_optimizer=True, map_location=None):
+                terrain = self.env.unwrapped.scene.terrain
+                report = None
+                if self.log_dir is not None and terrain.cfg.training_stage != "hard":
+                    report_path = self.cfg.get("stage_report", "")
+                    if not report_path:
+                        raise ValueError("Soft/mixed training needs --stage-report from mixed-eval for this checkpoint")
+                    report = json.loads(Path(report_path).read_text())
+                    validate_stage_report(report, path)
+                    if (report.get("soft") is None or report["soft"]["terrain_spec"] != self._topology()
+                            or report["soft"]["physics_dt"] != self.env.unwrapped.physics_dt):
+                        raise ValueError("Soft evaluation geometry/material/timestep must match the training environment")
+                saved = torch.load(path, map_location="cpu", weights_only=False)
+                state = soil_stage_state((saved.get("infos") or {}).get("dreamwaq_stage"), terrain.cfg)
+                level = report["decision"]["next_soft_level"] if report is not None else (
+                    state["soft_level_ceiling"] if state is not None else 0)
+                if (state is not None or report is not None) and getattr(terrain, "num_soft", 0) and terrain.soft_level != level:
+                    raise ValueError("Soil level differs from the already-built mesh; rebuild the environment at the checkpoint/report level")
+                result = super().load(path, load_optimizer=load_optimizer, map_location=map_location)
+                self.stage_state = deepcopy(state) if state is not None else None
+                if report is not None:
+                    if self.stage_state is None:
+                        self.stage_state = {"topology": self._topology(), "soft_started": False}
+                    self.stage_state["hard_reference"] = report["hard_reference"]
+                    self.stage_state["soft_level_ceiling"] = report["decision"]["next_soft_level"]
+                if self.stage_state is not None and getattr(terrain, "num_soft", 0) and terrain.soft_curriculum_active:
+                    ceiling = self.stage_state["soft_level_ceiling"]
+                    terrain.cfg.soft_level_ceiling = ceiling
+                    ids = terrain.soft_mask.nonzero().flatten()
+                    zeros = torch.zeros_like(ids, dtype=torch.bool)
+                    terrain.update_soft_origins(ids, zeros, zeros)
+                    terrain.soft_contact_steps.zero_()
+                    terrain.soft_sample_steps.zero_()
+                    # Native spawn events use the restored origins; partial soil
+                    # memory is deliberately reset rather than replayed mid-step.
+                    with torch.inference_mode():
+                        self.env.reset()
+                    print(f"[Stage curriculum] fixed level={ceiling}; five-tile geometry and scenario assignment restored", flush=True)
+                return result
+
+            def _topology(self):
+                return soil_curriculum_spec(self.env.unwrapped.scene.terrain.cfg)
+
+            def save(self, path, infos=None):
+                terrain = self.env.unwrapped.scene.terrain
+                state = deepcopy(self.stage_state) if self.stage_state is not None else {
+                    "topology": self._topology(), "soft_started": False, "soft_level_ceiling": 0}
+                if getattr(terrain, "num_soft", 0) and terrain.soft_curriculum_active:
+                    state["soft_started"] = True
+                    state["soft_level_ceiling"] = terrain.soft_level
+                # Metadata travels through hard rehearsal checkpoints as well.
+                merged = dict(infos or {}, dreamwaq_stage=state)
+                if not hasattr(self, "logger_type"):
+                    self.logger_type = "tensorboard"
+                return super().save(path, infos=merged)
+
+        runner_type = StageRunner
+        if log_dir is not None and env.unwrapped.cfg.scene.terrain.training_stage != "hard" and not (checkpoint or train_cfg.get("resume")):
+            raise ValueError("Begin from scratch with --stage hard; evaluate it before starting a soft stage")
+    runner = runner_type(env, train_cfg, log_dir=log_dir, device=device)
     if checkpoint:
         runner.load(str(checkpoint), load_optimizer=False)
         runner.current_learning_iteration = 0
@@ -937,9 +1265,27 @@ def make_runner(env, train_cfg, log_dir=None, device="cpu"):
     return runner
 
 
-def make_env(cfg, overview=False, stage=None, **kwargs):
+def make_env(cfg, overview=False, stage=None, physics_substeps=None, isolated_training=False,
+             stage_report=None, soft_level=None, **kwargs):
     if stage is not None:
         cfg.scene.terrain.training_stage = stage
+    if physics_substeps is not None:
+        cfg.scene.terrain.physics_substeps = physics_substeps
+    if isinstance(cfg.scene.terrain, MixedSoilTerrainCfg):
+        cfg.scene.terrain.isolated_training = isolated_training or cfg.scene.terrain.isolated_training
+        if cfg.scene.terrain.isolated_training and cfg.scene.terrain.training_stage == "mixed":
+            raise ValueError("Training uses separate hard/soft scenes; use mixed-play for the combined scene")
+        if soft_level is not None:
+            cfg.scene.terrain.soft_level_ceiling = soft_level
+        if isolated_training and cfg.scene.terrain.training_stage == "soft" and not cfg.scene.terrain.soft_spatial_curriculum:
+            if not stage_report:
+                raise ValueError("Soft training needs --stage-report before its fixed-level terrain is built")
+            from run_soft import validate_stage_report
+            report = json.loads(Path(stage_report).read_text())
+            validate_stage_report(report, report["checkpoint"])
+            if report.get("soft") is None or report["soft"]["terrain_spec"] != soil_curriculum_spec(cfg.scene.terrain):
+                raise ValueError("Re-run mixed-eval: a matching five-tile soil report is required")
+            cfg.scene.terrain.soft_level_ceiling = report["decision"]["next_soft_level"]
     enable_soil(cfg)
     if overview and isinstance(cfg.scene.terrain, MixedSoilTerrainCfg):
         terrain = cfg.scene.terrain
@@ -952,5 +1298,7 @@ def make_env(cfg, overview=False, stage=None, **kwargs):
         cfg.viewer.origin_type = "world"
         cfg.viewer.lookat = (0.0, centre_y, 0.0)
         cfg.viewer.eye = (0.9 * span, centre_y + 0.9 * span, 1.1 * span)
-    env_type = MixedSoilEnv if isinstance(cfg.scene.terrain, MixedSoilTerrainCfg) else ManagerBasedRLEnv
+    native_hard = (isinstance(cfg.scene.terrain, MixedSoilTerrainCfg)
+                   and cfg.scene.terrain.isolated_training and cfg.scene.terrain.training_stage == "hard")
+    env_type = MixedSoilEnv if isinstance(cfg.scene.terrain, MixedSoilTerrainCfg) and not native_hard else ManagerBasedRLEnv
     return env_type(cfg=cfg, **{k: v for k, v in kwargs.items() if not k.endswith("_entry_point")})

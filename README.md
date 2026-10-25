@@ -177,32 +177,113 @@ not footprint depressions. Memory is per environment and is cleared on reset.
 Tune physical parameters with Hydra, e.g. `env.scene.terrain.depth=0.10` or
 `env.scene.terrain.material=f0.9`, without changing model code.
 
-### Mixed original rough terrain and fixed soil scenarios
+### Standalone 5 x 5 soil curriculum
 
-`mixed-train` uses the original policy and PPO update. Half of the robots start
-on the original rough terrain and half on the added soil cells by default. The
-soil cells occupy the next **five +Y columns of the same grid**, with one shared
+`soil-train` generates an isolated soil scene with 25 fixed tiles, without the
+original rough terrain. Five columns are flat soil, mound, basin, undulating soil
+and alternating hard/soft bands. Five rows are difficulty levels 0--4. Each tile
+is 8 x 8 m with a 6 x 6 m interior and a 1 m flat rigid frame on each side.
+The five rows' geometry scales are 0.10, 0.325, 0.55, 0.775 and 1.0; bearing
+multipliers are 4, 2.828, 2, 1.414 and 1. Lower rows use wider hard/soft bands.
+Drag, soil depth and footprint parameters keep their existing values.
+
+Robots start randomly at levels 0--1, distributed evenly over scenario columns.
+At episode reset, the native IsaacLab `terrain_levels_vel` function promotes a
+robot when its horizontal distance from the tile origin exceeds 4 m. Otherwise
+it demotes the robot when that distance is below half the product of CURRENT
+command speed and configured maximum episode duration. This uses straight-line
+displacement, not accumulated path length or an integral of earlier commands.
+There is no added fall/contact gate. Initial/manual resets with zero elapsed
+episode length do not advance the curriculum. The minimum level is 0; advancing
+past level 4 redistributes the robot randomly over levels 0--4. Its column stays
+fixed. All meshes exist before training and never deform/relabel on promotion;
+actual foot position selects the local surface height and row-specific material.
+Partial reset clears only that robot's footprint memory. Like the original hard
+task, this task uses native episode timeouts/base-contact termination and a flat
+outer border, without the staged task's extra domain-edge timeout. This lets
+robots in outer rows cross the 4 m promotion threshold.
+
+The task defaults to **64 substeps at 0.3125 ms**, 20 ms control and 48 contact
+history samples (15 ms). Model, observations, PPO, rewards and actuators retain
+the original settings. Starting without checkpoint/resume randomly initializes
+all networks and starts a fresh optimizer at iteration 0. No passing hard-ground
+report is required for this standalone task.
+
+```bash
+# Diagnostic only: geometry/materials, native grade transitions, partial resets,
+# checkpoint restoration and one discarded PPO update. Does not call learn.
+bash scripts/isaac.sh soil-check --headless --num_envs 25
+
+# Manually start a new 2000-iteration training run.
+bash scripts/isaac.sh soil-train --headless --num_envs 512 \
+  --max_iterations 2000 --seed 1 --run_name soil_curriculum_64substeps_seed1
+
+# Visualize a selected checkpoint; the checkpoint supplies the learned grades.
+bash scripts/isaac.sh soil-play --num_envs 5 --checkpoint /absolute/path/model_1999.pt
+```
+
+Outputs stay under `logs/rsl_rl/isaaclab/go2_dreamwaq_soft_curriculum/<run>/`.
+Checkpoints carry the spatial layout, timestep and per-robot curriculum levels;
+same-count resume restores grades, optimizer and native iteration counter using
+`--resume True --load_run <run-folder> --checkpoint model_N.pt`. Play with fewer
+robots cycles saved grades within the same scenario column. Different layout,
+material or timing metadata is rejected rather than silently reinterpreted.
+TensorBoard at `logs/rsl_rl/` includes `Curriculum/terrain_levels`,
+`SoilCurriculum/<scenario>_level` and per-level population fractions, plus
+`SoilScenario/<scenario>_tracking_rmse_xy`, soft-contact fraction and termination
+statistics. Check mode uses `go2_dreamwaq_soft_curriculum_check/<run>/`.
+
+### Mixed original rough terrain and fixed-level soil stages
+
+Training uses separate hard/soft scenes with the original policy and PPO update
+(see the staged commands below). In the combined testing scene, half of the
+robots start on each domain by default. The soil cells occupy the next
+**five adjacent tiles on the +Y side of the same grid**, with one shared
 outer border. Every cell is **8 x 8 m**; its **6 x 6 m** interior is surrounded
 by **1 m of flat rigid ground**, giving 2 m lanes between neighbouring interiors.
-The fixed scene types, in column order, are:
+The scene types, in column order, are:
 
-| Column | Scenario | Fixed geometry |
+| Column | Scenario | Lowest grade → target grade |
 | --- | --- | --- |
-| 1 | `flat` | Flat uniform soil |
-| 2 | `mound` | Smooth 0.30 m hill |
-| 3 | `basin` | Smooth 0.20 m depression with walkable sides |
-| 4 | `undulating` | Windowed waves, amplitude parameter 0.10 m and wavelength 2 m |
-| 5 | `mixed` | Alternating 1 m soft/hard bands inside the cell |
+| 1 | `flat` | Flat soil; bearing capacity multiplier 4 → 1 |
+| 2 | `mound` | Smooth hill, height 0.03 → 0.30 m |
+| 3 | `basin` | Smooth depression, depth 0.02 → 0.20 m |
+| 4 | `undulating` | Windowed waves, amplitude 0.01 → 0.10 m, fixed wavelength 2 m |
+| 5 | `mixed` | Alternating soft/hard bands, width 3 → 1 m, snapped to the grid |
 
-There are 10 identical rows per type in training, or 5 in the reduced play scene.
-**There is no soil curriculum or progression**: each row repeats the same fixed
-profile and material (`f0.75`). The original rough-terrain curriculum is retained.
-`soft_columns` selects the number of appended columns; `soft_scenarios` selects
-the ordered scenario list (cycled if more columns are requested). For a flat-only
+The existing `mixed-*` and `joint-*` routes retain at most five physical soil tiles: one
+tile per type, at one shared logical difficulty level. The ten logical levels
+(0–9) do not create additional rows or meshes. Geometry amplitudes increase
+linearly with level. All five types use the same graded
+bearing capacity (4 → 1, geometric interpolation); drag, pull-out, memory, soil
+depth, spring/damping coefficients and physics timing remain fixed. The highest
+level reproduces the previous target geometry and `f0.75` material. These are initial
+curriculum settings, not a claim of calibrated real sand difficulty. The original
+rough-terrain curriculum is retained.
+
+Soft robots start at logical level 0 and retain their scenario tile. All five
+tiles use the same level, fixed for the entire process; episode resets neither
+promote nor demote robots. Material still follows actual foot position, so hard
+frames and internal hard bands remain rigid. Partial resets clear only that
+robot's footprint memory and contact counters. `SoilCurriculum/mean_level` and
+per-scenario `*_level` curves report the shared level. `soft_level_ceiling` now
+selects that exact level, and `soft_num_levels=10` defines the logical range.
+Only a passing hard-retention and five-scenario evaluation can authorize the
+next level. Its five meshes and material table are built BEFORE the next manually
+started soft stage; live geometry is never relabeled or deformed during a rollout.
+
+Play uses five tiles at the checkpoint's level when `--checkpoint` is an explicit
+file path; `mixed-play --soft-level 0` (through 9) overrides the displayed level.
+Without an explicit checkpoint/level it defaults to level 0. Its original hard
+map remains the smaller randomly arranged play map. For the
+previous fixed-scene control, train with `env.scene.terrain.soft_curriculum=false`
+(all five tiles at the target parameters), or check with `mixed-check --fixed_soil`.
+`soft_columns` selects one to five tiles; `soft_scenarios` selects
+the ordered scenario list. For a flat-only
 control use `env.scene.terrain.soft_columns=1` and
 `'env.scene.terrain.soft_scenarios=[flat]'` during training.
 `soft_fraction` still controls the number of soil-spawn robots independently of
-map area. Spawn sampling cycles across all types, then rows; soil memory remains
+map area. Spawn sampling cycles across types at the shared level; soil memory remains
 isolated per robot. `soft_border`, `soft_resolution`, `soft_mound_height`,
 `soft_basin_depth`, `soft_wave_height`, `soft_wave_length` and `soft_stripe_width`
 are stored in the resolved configuration. Grid spacing defaults to 0.1 m.
@@ -225,35 +306,46 @@ are accounted for. Original active-cell triangles are retained; only the flat
 perimeter is rebuilt around the extended grid. Source/active rough mesh and soil
 surface hashes are recorded. Use a new run name for this five-scenario variant.
 
-The mixed scene now defaults to the **32-substep speed experiment**: 0.625 ms
-physics, 50 Hz control and a 15 ms contact-history window (24 samples). Set
-`env.scene.terrain.physics_substeps=64` to select the converged 0.3125 ms reference
-(48 contact samples). This one selector resolves dt, decimation, render interval
+Soft physics now defaults to **64 substeps**: 0.3125 ms physics, 50 Hz control,
+and a 15 ms contact-history window (48 samples). Explicitly select
+`env.scene.terrain.physics_substeps=32` for the 0.625 ms speed experiment
+(24 contact samples), or `=16` for the 1.25 ms experiment (12 contact samples).
+The policy period stays at 20 ms and the contact window at 15 ms in all cases.
+This one selector resolves dt, decimation, render interval
 and contact sampling together after Hydra overrides. The standalone flat soil
 task retains its 64-substep default; historical original rough runs use 5 ms
 physics. Both remain separate evaluation references. Earlier 32-substep standing
 tests passed basic thresholds but retained high-frequency oscillation; record
 this as a distinct numerical experiment rather than an equivalent replacement.
 Network/CENet inputs, losses, PPO settings, rewards, commands and actuators are
-unchanged. Terrain curriculum applies only to the rough group; soft origins and
-per-environment soil memory remain isolated across resets.
+unchanged. Hard robots keep the native per-robot curriculum; soil grade changes
+only at stage boundaries. Per-environment soil memory remains isolated across resets.
+
+For an explicit **4-substep mixed visualization experiment**, use
+`mixed-play --substeps 4 --stage mixed`. Both hard and soft
+robots then use 5 ms physics, 20 ms control and a three-frame (15 ms) contact
+history. The default is 64, the convergence reference. Earlier
+5 ms flat-soil fixed-target standing tests showed strong joint oscillation; a
+finite-data/PPO interface check does not establish physically stable training.
+Keep 4-substep soil runs for diagnostic/historical comparisons. The staged
+training gate requires the evaluated soft timestep to match the training timestep;
+the normal workflow below evaluates soft physics at 64 substeps.
+
+The short acceptance and sampling benchmark also accept `--substeps 4`:
+`bash scripts/isaac.sh mixed-check --headless --num_envs 12 --steps 100 --substeps 4`
+and `bash scripts/isaac.sh mixed-profile --headless --stage mixed --num_envs 2048 --substeps 4`.
 
 ```bash
 # Acceptance only: geometry, force/contact/reset isolation and one discarded
 # PPO update. No trained checkpoint is written and runner.learn is not called.
 bash scripts/isaac.sh mixed-check --headless --num_envs 12 --steps 100
 
-# Start formal training MANUALLY from the original rough checkpoint.
-bash scripts/isaac.sh mixed-train --headless --num_envs 2048 \
-  --max_iterations 2000 --seed 1 --run_name rough_soil_scenarios_32substeps_seed1 \
-  env.scene.terrain.physics_substeps=32 \
-  env.scene.terrain.soft_fraction=0.5 \
-  agent.init_checkpoint=/home/allvey/Projects/robotics/dreamwaq-isaaclab/logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1/model_1999.pt
-
 # View the mixed task, initially following rough env 0 (at least two required).
 bash scripts/isaac.sh mixed-play --num_envs 12 --checkpoint /absolute/path/model.pt
 # Show the original terrain and all five soil scenario columns from above.
 bash scripts/isaac.sh mixed-play --overview --num_envs 12 --checkpoint /absolute/path/model.pt
+# One soil robot; match the checkpoint's training physics (4/16/32/64).
+bash scripts/isaac.sh mixed-play --stage soft --num_envs 1 --substeps 4 --checkpoint /absolute/path/model.pt
 
 # Evaluate two legacy references (these do not cover all five soil scenarios):
 # the SAME checkpoint on the historical native rough task
@@ -275,49 +367,120 @@ per step, and the actual soft sample fraction; these are not episode success
 rates. `SoilScenario/` adds the same metrics per soil spawn type.
 Use `logs/rsl_rl/` as the TensorBoard root. Evaluate multiple seeds before
 selecting a checkpoint; combined training reward alone can hide standing drift.
-To continue an existing mixed checkpoint with optimizer state, use `--resume True
+To continue an existing checkpoint with optimizer state, select
+`--stage hard` or `--stage soft --stage-report <matching-report>` and use `--resume True
 --load_run <existing-run> --checkpoint model_<iteration>.pt` and a new `--run_name`
 containing `32substeps`; omit `agent.init_checkpoint`. The native runner writes a
 new run directory and treats `--max_iterations` as additional iterations after
 the loaded counter. Existing training processes retain their original timestep;
 they are never automatically stopped or restarted.
 
-### Separate hard/soft stages on the same complete map
+### Separate hard/soft training scenes; combined evaluation scene
 
-`mixed-train --stage hard` and `mixed-train --stage soft` retain the ENTIRE map,
-including all original rough cells and all five soil types. They change robot
-sampling and physics timing, not map geometry. The default `--stage mixed` keeps
-the existing simultaneous training mode.
+`mixed-train --stage hard` loads only the original rough terrain, using the native
+IsaacLab environment, terrain importer, height scanner, curriculum and termination
+rules. No soil meshes, proxy or stage-boundary timeout are created. Network/PPO
+settings remain unchanged, while checkpoint metadata retains the soft curriculum
+through hard rehearsal. Matching configurations do not guarantee deterministic
+GPU training or identical learning curves.
+
+`mixed-train --stage soft` loads only five tiles at the approved level, centered around
+the origin, with their existing hard frames/lanes and lower support surfaces.
+It does not generate or import the original rough grid. Soil difficulty, forces,
+observations, rewards and performance gates are unchanged. `mixed-train` defaults
+to `--stage hard`; simultaneous `--stage mixed` training is no longer supported.
+`mixed-play` and `mixed-eval` retain the combined scene for comparison, including
+when play limits robots to `--stage hard` or `--stage soft`.
 
 | Stage | Robot spawn region | Physics per 20 ms control step | Soil proxy |
 | --- | --- | --- | --- |
 | `hard` | Original rough cells only | 4 steps at 5 ms | Disabled; native actions/contact sensor |
-| `soft` | Five soil columns, including their hard lanes | 32 steps at 0.625 ms (or selected 64) | Enabled |
+| `soft` | Five soil tiles, including their hard lanes | 64 steps at 0.3125 ms by default | Enabled |
 
 Hard-stage contact history retains the original three samples (15 ms); soft-stage
-history retains 24/48 samples (15 ms). Network inputs, PPO, rewards and PD settings
-are unchanged. Hard-stage rough curriculum remains active. Soft-stage origins
-stay fixed, and no soil difficulty progression is added. `soft_fraction` applies
+history retains 12/24/48 samples for 16/32/64 substeps (15 ms). Network inputs, PPO, rewards and PD settings
+are unchanged. Hard-stage rough curriculum remains active. Soft-stage robots use
+the soil curriculum described above. `soft_fraction` applies
 only to the simultaneous `mixed` stage; pure stages use 100% of their domain.
+In a pure soft run, `Curriculum/terrain_levels=0` is the empty-hard-group
+placeholder; inspect `SoilCurriculum/mean_level` and `level_ceiling` instead.
 
-A boundary timeout resets a robot as its body links approach within 0.6 m of the
-stage region boundary. It is a truncation with the existing RSL-RL timeout
-bootstrap, not a fall/success reward. Reset and rough curriculum remain confined
-to the selected domain. `Stage/boundary_fraction` reports these events separately.
-The complete mesh remains loaded, so speed gains must be measured, particularly
-for the soft stage. There is no automatic stage scheduler or in-process timestep
+Only the soil training scene and domain-limited combined evaluations use a boundary
+timeout within 0.6 m of the domain edge. Hard training keeps the original outer
+flat border and termination rules. `Stage/boundary_fraction` reports boundary
+events where enabled. There is no automatic stage scheduler or in-process timestep
 switch: finish/checkpoint one manual run, then manually start the next one.
+Existing running processes and old results are unaffected. Resuming an earlier
+combined-scene hard checkpoint uses the new isolated scene for subsequent updates;
+use a fresh run to compare from-scratch training fairly.
 
-For example, warm-start a new soft-stage run from the original rough weights:
+Inference-only checks (temporary recordings can be placed outside the project):
+
+```bash
+bash scripts/isaac.sh soft-check --headless --hard_training --stock --num_envs 20 --steps 50 --record /tmp/original_hard.npz
+bash scripts/isaac.sh soft-check --headless --hard_training --num_envs 20 --steps 50 --compare /tmp/original_hard.npz
+bash scripts/isaac.sh mixed-stage-check --headless --stage soft --isolated_training --substeps 64 --num_envs 10 --steps 50
+bash scripts/isaac.sh mixed-check --headless --num_envs 12 --steps 50 --substeps 64 --soft_level 9
+```
+
+Start from random weights on hard ground (no init checkpoint or resume):
+
+```bash
+bash scripts/isaac.sh mixed-train --stage hard --headless --num_envs 2048 \
+  --max_iterations 2000 --seed 1 --run_name hard_base_seed1
+```
+
+Evaluate a saved checkpoint without training. The fixed hard holdout covers all
+20 hard columns at levels 0/2/4 (60 robots). If hard performance passes, a second
+process evaluates all five soil types at the current approved level (10 robots).
+Commands are stand / forward 0.3 m/s / lateral 0.2 m/s / turn 0.4 rad/s / stand,
+four seconds each, with the first second excluded from tracking/progress scores.
+
+```bash
+bash scripts/isaac.sh mixed-eval --headless --checkpoint /absolute/path/model_N.pt
+```
+
+Results stay beside that checkpoint under `evaluations/<timestamp>/`, including
+`stage_report.json` and the existing per-case rollout artifacts. Initial gate
+thresholds are XY tracking RMSE <=0.25 m/s, <=20% of robots falling during the
+holdout, and forward displacement >=50% of the requested distance. They are
+engineering starting thresholds, not a universal locomotion benchmark.
+
+The first passing hard evaluation becomes the persistent hard reference. Later
+hard scores must also retain >=80% of reference forward progress, increase the
+tracking RMSE by no more than max(20%, 0.03 m/s), and increase fall fraction by
+no more than 0.05. An explicit `--hard-reference <earlier-stage_report.json>` can
+select an earlier passing reference; seed, robot count, schedule and hard mesh
+must match. Default evaluation seed/count/duration should be kept fixed.
+
+Resume a short soft block only after `can_train_soft=true` in the matching report:
 
 ```bash
 bash scripts/isaac.sh mixed-train --stage soft --headless --num_envs 2048 \
-  --max_iterations 100 --seed 1 --run_name stage_soft_seed1 \
-  env.scene.terrain.physics_substeps=32 \
-  agent.init_checkpoint=logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1/model_1999.pt
+  --max_iterations 10 --seed 1 --run_name soft_block1_seed1 \
+  --resume True --load_run <hard-run-folder> --checkpoint model_N.pt \
+  --stage-report /absolute/path/evaluations/<timestamp>/stage_report.json
 ```
 
-To continue into the hard stage, preserving model, optimizer and iteration state:
+Admission checks the exact checkpoint SHA256, evaluated soft geometry/material
+and physical timestep. The first soft block starts at level 0 even if zero-shot
+soft evaluation passes. Subsequent evaluations open one additional level only
+when hard retention and ALL five current soil types pass. Otherwise the ceiling
+holds; hard regression yields `hard_rehearsal` and blocks the next soft block.
+All five tiles and all soil robots stay at the exact approved level for the run.
+The report is read before environment creation, so approval changes real geometry
+and bearing parameters, rather than only a recorded level. Old multi-row soil
+reports must be regenerated with `mixed-eval`.
+
+For a 16-substep soft speed experiment, first evaluate the SAME checkpoint with
+`mixed-eval --substeps 16 --checkpoint ... --headless`, then supply its matching
+`--stage-report` and `env.scene.terrain.physics_substeps=16` to `mixed-train
+--stage soft`. A 64-substep report cannot authorize a 16-substep run. These are
+numerical experiments: finite observations and a successful PPO update do not
+establish physical convergence. The 64-substep default/reference is retained.
+
+After every short soft block, run `mixed-eval` on its newest checkpoint. If hard
+performance declines, resume a hard rehearsal block:
 
 ```bash
 bash scripts/isaac.sh mixed-train --stage hard --headless --num_envs 2048 \
@@ -325,16 +488,107 @@ bash scripts/isaac.sh mixed-train --stage hard --headless --num_envs 2048 \
   --resume True --load_run <previous-soft-run-folder> --checkpoint <model_N.pt>
 ```
 
-Then use `--stage soft` and the hard run's checkpoint for the next soft stage.
+Evaluate again, then use `--stage soft`, its matching report and the hard run's
+checkpoint for the next soft block. Evaluations inherit the original hard
+reference from checkpoint metadata. The shared soft level travels inside existing
+`.pt` checkpoints through hard rehearsal. Legacy ten-row checkpoints can migrate
+their approved ceiling to the shared level when material/level definitions match;
+old per-robot levels are intentionally discarded. Other geometry/material changes
+are rejected instead of silently resetting the curriculum. Footprint and
+episode state reset normally when a new process starts.
 With resume, `max_iterations` is the number of ADDITIONAL iterations. Do not add
 `agent.init_checkpoint` when resuming. Every command creates a new timestamped
 run under `logs/rsl_rl/isaaclab/go2_dreamwaq_mixed/`, keeping previous results.
-The 100-iteration blocks are an example, not a validated optimal stage schedule.
+Block lengths are examples, not a validated optimal schedule. There is no
+automatic training start/stop or mid-block hard monitoring: keep soft blocks short
+and perform the fixed evaluation at stage boundaries.
 
 Stage choice also works with play; its CLI is `--stage hard` or `--stage soft`.
 Hydra training can instead set `env.scene.terrain.training_stage=hard/soft`.
 Use one stage selector consistently. Resolved `params/env.yaml` records the stage,
 actual dt/decimation, boundary margin and realized group counts.
+
+### Joint hard/soft sampling with different physics steps
+
+`joint-train` runs two headless simulator processes and one central DreamWaQ
+model/optimizer. Hard sampling uses the original isolated rough scene at 4
+substeps; soft sampling uses the isolated five-tile scene at 16 or 64 substeps.
+Both return one transition per 20 ms. Actions come from the same frozen policy
+throughout each 24-step rollout; both groups are then passed to the original PPO
+update. Observations, CENet, rewards, PD gains and PPO settings are unchanged.
+Timeouts, episode boundaries and GAE remain independent for every robot.
+
+Start with 128 hard + 128 soft robots. Equal counts give equal numbers of samples
+from each domain. This is 256 robots in total, so an iteration contains fewer
+samples than an earlier 2048-robot run. Two simulator processes duplicate their
+base memory; smaller PhysX contact/aggregate storage capacities are recorded in
+each environment YAML, and reported capacity/device errors abort sampling.
+CPU NumPy transport avoids sharing CUDA contexts. Sharing one GPU does not
+guarantee faster sampling than a single simulator.
+
+First run a short interface check. It discards one native PPO update, writes no
+trained checkpoint and never invokes the training loop:
+
+```bash
+base=logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1
+bash scripts/isaac.sh joint-check --checkpoint "$base/model_1999.pt" \
+  --hard-envs 128 --soft-envs 128 --soft-substeps 16
+```
+
+To manually train a new model for 2000 iterations in both environments:
+
+```bash
+bash scripts/isaac.sh joint-train --from-scratch \
+  --hard-envs 128 --soft-envs 128 --soft-substeps 16 \
+  --max_iterations 2000 --seed 1 --run_name joint_scratch_2000_seed1
+```
+
+`--from-scratch` randomly initializes the entire DreamWaQ network, with an empty
+optimizer and iteration counter 0. Omit `--checkpoint`, `--resume` and
+`--stage-report`. Hard terrain retains its native curriculum. All five soft tiles
+start at level 0 and stay at that level throughout this run; there is no automatic
+soft-level advancement inside a joint run. `--soft-substeps 64` also works for
+scratch training. To check random initialization and both interfaces without
+starting formal training, run `joint-check --from-scratch` with the same robot
+counts and substeps.
+
+To manually start a five-iteration joint experiment from the good original model,
+use its existing five-tile, 16-substep evaluation report:
+
+```bash
+base=logs/rsl_rl/isaaclab/go2_dreamwaq_rough/2026-10-18_14-35-23_clean_seed1
+bash scripts/isaac.sh joint-train --checkpoint "$base/model_1999.pt" \
+  --stage-report "$base/evaluations/2026-10-24_16-45-59_282941/stage_report.json" \
+  --hard-envs 128 --soft-envs 128 --soft-substeps 16 \
+  --max_iterations 5 --seed 1 --run_name joint_128x128_16substeps_seed1
+```
+
+These commands are always headless. With `--checkpoint`, they load all network weights
+with a fresh optimizer and iteration counter. Add `--resume` to restore the
+checkpoint's optimizer and counter; `--max_iterations` then adds iterations.
+Checkpoint-based training requires the exact checkpoint's passing hard evaluation and matching
+soil layout/timestep. The approved soil level stays fixed throughout a run.
+16 substeps remain a numerical experiment; successful interface checks do not
+establish physical convergence or improved locomotion. To fine-tune using 64, first generate
+a matching report with `mixed-eval --substeps 64` and select `--soft-substeps 64`.
+
+Runs are saved under `logs/rsl_rl/isaaclab/go2_dreamwaq_joint/<run>/`, with
+checkpoints, TensorBoard events, `params/agent.yaml`, both environment YAMLs,
+`params/joint.json` and worker logs together. Diagnostic checks use
+`go2_dreamwaq_joint_check/<run>/`. TensorBoard at `logs/rsl_rl/` includes both;
+`Joint/hard/` and `Joint/soft/` separate domain statistics.
+
+After a short block, evaluate BOTH domains even if hard performance regresses:
+
+```bash
+bash scripts/isaac.sh mixed-eval --headless --all-stages --substeps 16 \
+  --checkpoint logs/rsl_rl/isaaclab/go2_dreamwaq_joint/<run>/model_4.pt
+```
+
+`--all-stages` collects both results without changing curriculum/admission gates.
+Existing `mixed-play --stage hard/soft --checkpoint ...` can visualize these
+checkpoints in the combined scene. Include `--substeps 16` when visualizing a
+16-substep soft checkpoint; hard play keeps its original 4 steps.
 
 ```bash
 # Diagnostic acceptance only; no runner.learn or model save.
@@ -344,6 +598,10 @@ bash scripts/isaac.sh mixed-stage-check --headless --stage soft --substeps 32 --
 bash scripts/isaac.sh mixed-profile --headless --stage hard --num_envs 2048 --checkpoint /absolute/path/model.pt
 bash scripts/isaac.sh mixed-profile --headless --stage soft --substeps 32 --num_envs 2048 --checkpoint /absolute/path/model.pt
 ```
+
+`mixed-profile --stage hard/soft` measures the corresponding isolated training
+scene. Soil difficulty defaults to the checkpoint's shared level; `--soft_level N`
+selects a diagnostic level explicitly. `--stage mixed` profiles the combined map.
 
 ### Sampling performance
 
